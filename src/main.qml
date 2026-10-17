@@ -1246,7 +1246,7 @@ Rectangle {
             }
             Btn {
                 icon: root.showPlanning ? "eye" : "eye-off"
-                label: "Plan"
+                label: "Grey" // show or hide the grey (planning) lines
                 flat: true
                 enabledLook: root.showPlanning
                 onTap: root.showPlanning = !root.showPlanning
