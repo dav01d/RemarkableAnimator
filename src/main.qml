@@ -31,8 +31,12 @@ Rectangle {
     property int frameKeys: 0  // last frame key handed out; the storage worker caches saved frames by key
 
     // Tools
-    // One pressure-sensitive pen in three sizes, black or grey. Flip the Marker to erase.
+    // One pressure-sensitive pen in three sizes: black to finish, light grey to plan.
+    // Flip the Marker, or pick the eraser, to erase.
     property string inkColor: "#000000"
+    readonly property string planInk: "#c0c0c0"
+    property bool eraserTool: false
+    property bool showPlanning: true    // planning ink on screen; export always leaves it out
     property var sizes: [2, 5, 10]
     property int sizeIndex: 1
 
@@ -77,6 +81,10 @@ Rectangle {
     readonly property bool canRedo: historyRev >= 0 && !!frame && frame.redo.length > 0
 
     onCurrentChanged: refreshLayers()
+    onShowPlanningChanged: {
+        for (var i = 0; i < frames.length; i++) frames[i].full = true;
+        refreshLayers();
+    }
 
     // Latency probe: pen move -> next frame the window has drawn (app side only; the e-ink
     // panel adds its own refresh on top)
@@ -403,7 +411,11 @@ Rectangle {
         return out;
     }
 
+    // Any ink but black is planning (older animations used a darker grey)
+    function isPlanning(s) { return s.color !== "#000000"; }
+
     function drawStroke(ctx, s, strength) {
+        if (!showPlanning && isPlanning(s)) return;
         var pts = s.pts, color = strength ? fade(s.color, strength) : s.color;
         ctx.globalCompositeOperation = s.tool === "area" ? "destination-out" : "source-over";
         ctx.strokeStyle = color;
@@ -532,6 +544,7 @@ Rectangle {
         var R = 16, strokes = frame.strokes, hitAny = false;
         for (var i = strokes.length - 1; i >= 0; i--) {
             var s = strokes[i], b = bounds(s), reach = R + b.w / 2;
+            if (!showPlanning && isPlanning(s)) continue; // don't rub out what you can't see
             if (x < b.x0 - reach || x > b.x1 + reach || y < b.y0 - reach || y > b.y1 + reach) continue;
             var pieces = [], run = [], hit = false;
             for (var j = 0; j < s.pts.length; j++) {
@@ -701,6 +714,13 @@ Rectangle {
                 c.stroke();
                 c.beginPath(); c.moveTo(4, 11); c.lineTo(13, 4); c.lineTo(13, 18); c.closePath(); c.fill();
                 return;
+            case "eraser": // a tilted block, its tip marked off
+                c.moveTo(6, 22); c.lineTo(19, 9); c.lineTo(30, 20); c.lineTo(17, 33); c.closePath();
+                c.moveTo(12, 16); c.lineTo(23, 27); break;
+            case "eye-off": c.moveTo(7, 29); c.lineTo(29, 7); // then the eye, struck through
+            case "eye":
+                c.moveTo(4, 18); c.quadraticCurveTo(18, 4, 32, 18); c.quadraticCurveTo(18, 32, 4, 18);
+                c.moveTo(23, 18); c.arc(18, 18, 5, 0, 2 * Math.PI); break;
             case "close": c.moveTo(9, 9); c.lineTo(27, 27); c.moveTo(27, 9); c.lineTo(9, 27); break;
             case "projects": c.rect(6, 6, 10, 10); c.rect(20, 6, 10, 10); c.rect(6, 20, 10, 10); c.rect(20, 20, 10, 10); break;
             case "share": // arrow up out of a tray
@@ -762,7 +782,7 @@ Rectangle {
                     on: root.sizeIndex === index
                     flat: true
                     width: 58
-                    onTap: root.sizeIndex = index
+                    onTap: { root.sizeIndex = index; root.eraserTool = false; }
                     Rectangle {
                         anchors.centerIn: parent
                         width: 6 + index * 10; height: width; radius: width / 2
@@ -772,15 +792,16 @@ Rectangle {
             }
             Item { width: 12; height: 1 } // gap between groups
             Repeater {
-                model: ["#000000", "#808080"]
+                model: ["#000000", root.planInk]
                 Btn {
-                    on: root.inkColor === modelData
+                    on: root.inkColor === modelData && !root.eraserTool
                     flat: true
                     width: 58
-                    onTap: root.inkColor = modelData
+                    onTap: { root.inkColor = modelData; root.eraserTool = false; if (index) root.showPlanning = true; }
                     Rectangle { anchors.centerIn: parent; width: 30; height: 30; radius: 6; color: modelData; border.color: "white"; border.width: 2 }
                 }
             }
+            Btn { icon: "eraser"; flat: true; width: 58; on: root.eraserTool; onTap: root.eraserTool = !root.eraserTool }
             Item { width: 12; height: 1 } // gap between groups
             Btn { icon: "undo"; flat: true; width: 58; enabledLook: root.canUndo; onTap: root.undo() }
             Btn { icon: "redo"; flat: true; width: 58; enabledLook: root.canRedo; onTap: root.redo() }
@@ -832,7 +853,7 @@ Rectangle {
             onPressed: (m) => {
                 if (m.source !== Qt.MouseEventNotSynthesized) { m.accepted = false; return; }
                 root.beginGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure },
-                                  root.penEraser || m.button !== Qt.LeftButton);
+                                  root.eraserTool || root.penEraser || m.button !== Qt.LeftButton);
             }
             onPositionChanged: (m) => root.moveGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure })
             onReleased: root.endGesture()
@@ -944,6 +965,13 @@ Rectangle {
                 flat: true
                 enabledLook: root.onionDepth > 0
                 onTap: root.onionDepth = (root.onionDepth + 1) % 4
+            }
+            Btn {
+                icon: root.showPlanning ? "eye" : "eye-off"
+                label: "Plan"
+                flat: true
+                enabledLook: root.showPlanning
+                onTap: root.showPlanning = !root.showPlanning
             }
             Btn { label: root.fps + " fps"; flat: true; onTap: root.fpsIndex = (root.fpsIndex + 1) % root.fpsOptions.length }
             Btn { label: "Clear"; flat: true; onTap: root.clearFrame() }
@@ -1158,7 +1186,7 @@ Rectangle {
     function runExportPipeline() {
         var W = 480, k = W / stage.width, H = Math.round(stage.height * k);
         var strokes = [];
-        for (var f = 0; f < frames.length; f++) strokes.push(frames[f].strokes);
+        for (var f = 0; f < frames.length; f++) strokes.push(frames[f].strokes.filter(s => !isPlanning(s))); // finished ink only
         exportWorker.sendMessage({ frames: strokes, W: W, H: H, k: k, fps: fps });
     }
 
