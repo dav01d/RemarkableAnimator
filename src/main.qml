@@ -79,6 +79,10 @@ Rectangle {
     // Export
     property string statusMessage: ""
     property string exportedUrl: ""
+    property string exportFormat: ""    // "gif" | "svg" | "zip"; empty while choosing
+    readonly property var exportFormats: ({ gif: { label: "GIF", file: "flipbook.gif", type: "image/gif" },
+                                            svg: { label: "Animated SVG", file: "flipbook.svg", type: "image/svg+xml" },
+                                            zip: { label: "SVG frames", file: "flipbook-svg.zip", type: "application/zip" } })
     property bool showExportModal: false
     property bool isExporting: false
 
@@ -932,7 +936,7 @@ Rectangle {
             Item { width: 12; height: 1 } // gap between groups
             Btn { icon: "undo"; flat: true; width: 58; enabledLook: root.canUndo; onTap: root.undo() }
             Btn { icon: "redo"; flat: true; width: 58; enabledLook: root.canRedo; onTap: root.redo() }
-            Btn { icon: "share"; flat: true; width: 58; onTap: root.startExport() }
+            Btn { icon: "share"; flat: true; width: 58; onTap: root.chooseExport() }
         }
         Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 2; color: "black" }
     }
@@ -1386,7 +1390,8 @@ Rectangle {
 
                 Text {
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: root.isExporting ? "Exporting..." : (root.exportedUrl !== "" ? "Your GIF is ready!" : "Export failed")
+                    text: !root.exportFormat ? "Share animation" : root.isExporting ? "Exporting..."
+                        : root.exportedUrl !== "" ? "Your " + root.exportFormats[root.exportFormat].label + " is ready!" : "Export failed"
                     font.pixelSize: 28; font.bold: true
                 }
 
@@ -1428,12 +1433,22 @@ Rectangle {
                     wrapMode: Text.WrapAnywhere
                 }
 
+                Row { // pick a format
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    spacing: 12
+                    visible: !root.exportFormat
+                    Repeater {
+                        model: ["gif", "svg", "zip"]
+                        Btn { label: root.exportFormats[modelData].label; on: index === 0; onTap: root.startExport(modelData) }
+                    }
+                }
+
                 Row {
                     anchors.horizontalCenter: parent.horizontalCenter
                     spacing: 20
                     visible: !root.isExporting
                     Btn { label: root.exportedUrl !== "" ? "Done" : "Cancel"; onTap: root.showExportModal = false }
-                    Btn { label: "Retry"; on: true; visible: root.exportedUrl === ""; onTap: root.startExport() }
+                    Btn { label: "Retry"; on: true; visible: root.exportFormat && root.exportedUrl === ""; onTap: root.startExport(root.exportFormat) }
                 }
             }
         }
@@ -1442,9 +1457,16 @@ Rectangle {
     // ---------------------------------------------------------------
     // EXPORT PIPELINE
     // ---------------------------------------------------------------
-    function startExport() {
+    function chooseExport() {
         isPlaying = false;
+        exportFormat = "";
+        exportedUrl = "";
+        statusMessage = "GIF plays anywhere; SVG keeps the lines sharp at any size (planning ink is left out)";
         showExportModal = true;
+    }
+
+    function startExport(format) {
+        exportFormat = format || "gif";
         isExporting = true;
         exportedUrl = "";
         statusMessage = "Rendering " + frameCount + " frames...";
@@ -1461,16 +1483,17 @@ Rectangle {
 
     function runExportPipeline() {
         var W = 480, k = W / stage.width, H = Math.round(stage.height * k);
-        var strokes = [];
+        var frames = [];
         for (var f = 0; f < frameCount; f++) {
-            var ink = [];
+            var shown = [];
             for (var l = layers.length - 1; l >= 0; l--) { // bottom layer first
                 var d = layers[l].visible ? drawingAt(l, f) : null;
-                if (d) ink = ink.concat(d.strokes.filter(s => !isPlanning(s))); // finished ink only
+                if (d) shown.push({ name: layers[l].name, strokes: d.strokes.filter(s => !isPlanning(s)) }); // finished ink only
             }
-            strokes.push(ink);
+            frames.push(shown);
         }
-        exportWorker.sendMessage({ frames: strokes, W: W, H: H, k: k, fps: fps });
+        exportWorker.sendMessage({ format: exportFormat, frames: frames, W: W, H: H, k: k,
+                                   stageW: Math.round(stage.width), stageH: Math.round(stage.height), fps: fps });
     }
 
     // Where Export uploads: catbox.moe by default (anonymous, no key). A tablet can override it
@@ -1493,21 +1516,22 @@ Rectangle {
         xhr.send();
     }
 
-    function upload(gifBytes) {
-        statusMessage = "Uploading GIF...";
+    function upload(fileBytes) {
+        var format = exportFormats[exportFormat];
+        statusMessage = "Uploading " + format.label + "...";
         var boundary = "----AnimatorBoundary" + Math.random().toString(36).substring(2);
         var head = "";
         for (var key in uploader.params)
             head += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + key + "\"\r\n\r\n" +
                     uploader.params[key] + "\r\n";
         head += "--" + boundary + "\r\n" +
-                "Content-Disposition: form-data; name=\"" + uploader.field + "\"; filename=\"flipbook.gif\"\r\n" +
-                "Content-Type: image/gif\r\n\r\n";
+                "Content-Disposition: form-data; name=\"" + uploader.field + "\"; filename=\"" + format.file + "\"\r\n" +
+                "Content-Type: " + format.type + "\r\n\r\n";
         var foot = "\r\n--" + boundary + "--\r\n";
-        var payload = new Uint8Array(head.length + gifBytes.length + foot.length);
+        var payload = new Uint8Array(head.length + fileBytes.length + foot.length);
         for (var h = 0; h < head.length; h++) payload[h] = head.charCodeAt(h);
-        payload.set(gifBytes, head.length);
-        for (var b = 0; b < foot.length; b++) payload[head.length + gifBytes.length + b] = foot.charCodeAt(b);
+        payload.set(fileBytes, head.length);
+        for (var b = 0; b < foot.length; b++) payload[head.length + fileBytes.length + b] = foot.charCodeAt(b);
 
         var xhr = new XMLHttpRequest();
         xhr.open("POST", uploader.url);

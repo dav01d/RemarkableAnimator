@@ -1,15 +1,106 @@
 // Runs in a WorkerScript thread: rasterizing and encoding takes seconds on the tablet, and
 // doing it on the UI thread stalls xochitl until its watchdog kills it.
-// job = { frames: [[stroke]], W, H, k, fps } -> replies { progress } ... then { bytes }
+// job = { format: "gif" | "svg" | "zip", frames: [[{ name, strokes: [stroke] }]] (per frame, layers
+//         bottom first), W, H, k (GIF size and scale), stageW, stageH, fps }
+//   -> replies { progress } ... then { bytes }
 
 WorkerScript.onMessage = function(job) {
+    if (job.format === "svg") return WorkerScript.sendMessage({ bytes: svgAnimation(job) });
+    if (job.format === "zip") return WorkerScript.sendMessage({ bytes: svgFrames(job) });
     var gif = createGif(job.W, job.H, job.fps);
     for (var i = 0; i < job.frames.length; i++) {
         WorkerScript.sendMessage({ progress: "Encoding frame " + (i + 1) + " of " + job.frames.length + "..." });
-        gif.addFrame(rasterize(job.frames[i], job.W, job.H, job.k));
+        var strokes = [].concat.apply([], job.frames[i].map(function(l) { return l.strokes; }));
+        gif.addFrame(rasterize(strokes, job.W, job.H, job.k));
     }
     WorkerScript.sendMessage({ bytes: gif.getBytes() });
 };
+
+// SVG: strokes as round-capped polylines, one per run of equal width (as the app draws them)
+function r1(v) { return Math.round(v * 10) / 10; }
+
+function strokeSvg(s) {
+    var pts = s.pts, out = "";
+    if (pts.length === 1)
+        return '<circle cx="' + r1(pts[0].x) + '" cy="' + r1(pts[0].y) + '" r="' + r1(pts[0].w / 2) + '" fill="' + s.color + '"/>';
+    for (var i = 1; i < pts.length; ) {
+        var w = pts[i].w, line = [r1(pts[i - 1].x) + "," + r1(pts[i - 1].y)];
+        while (i < pts.length && pts[i].w === w) { line.push(r1(pts[i].x) + "," + r1(pts[i].y)); i++; }
+        out += '<polyline points="' + line.join(" ") + '" stroke-width="' + w + '" stroke="' + s.color + '"/>';
+    }
+    return out;
+}
+
+function layersSvg(layers) {
+    return layers.map(function(l) {
+        var name = l.name.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+        return '<g data-layer="' + name + '">' + l.strokes.map(strokeSvg).join("") + '</g>';
+    }).join("");
+}
+
+function svgDoc(job, body) {
+    return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + job.stageW + ' ' + job.stageH + '" width="' +
+           job.stageW + '" height="' + job.stageH + '"><rect width="' + job.stageW + '" height="' + job.stageH + '" fill="#fff"/>' +
+           '<g fill="none" stroke-linecap="round" stroke-linejoin="round">' + body + '</g></svg>';
+}
+
+// One SVG that plays in a browser: each frame's group is shown for its slice of the loop
+function svgAnimation(job) {
+    var n = job.frames.length, body = "";
+    for (var i = 0; i < n; i++) {
+        var values = [], times = [];
+        if (i > 0) { values.push("none"); times.push(0); }
+        values.push("inline"); times.push(i / n);
+        if (i < n - 1) { values.push("none"); times.push((i + 1) / n); }
+        body += '<g display="' + (i ? "none" : "inline") + '"><animate attributeName="display" values="' + values.join(";") +
+                '" keyTimes="' + times.join(";") + '" dur="' + n / job.fps + 's" calcMode="discrete" repeatCount="indefinite"/>' +
+                layersSvg(job.frames[i]) + '</g>';
+    }
+    return Array.from(bytes(svgDoc(job, body)));
+}
+
+// A zip of frame-001.svg, frame-002.svg, ...
+function svgFrames(job) {
+    return Array.from(zip(job.frames.map(function(f, i) {
+        return { name: "frame-" + ("00" + (i + 1)).slice(-3) + ".svg", data: bytes(svgDoc(job, layersSvg(f))) };
+    })));
+}
+
+function bytes(text) {
+    var b = new Uint8Array(text.length);
+    for (var i = 0; i < text.length; i++) b[i] = text.charCodeAt(i) & 0xFF;
+    return b;
+}
+
+// A zip without compression ("stored"): local headers and data, then the central directory
+function zip(files) {
+    var table = [];
+    for (var n = 0; n < 256; n++) {
+        var c = n;
+        for (var k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+        table[n] = c >>> 0;
+    }
+    function le(v, size) { var b = []; for (var i = 0; i < size; i++) b.push((v >>> (8 * i)) & 0xFF); return b; }
+    var parts = [], dir = [], offset = 0;
+    files.forEach(function(f) {
+        var crc = 0xFFFFFFFF;
+        for (var i = 0; i < f.data.length; i++) crc = table[(crc ^ f.data[i]) & 0xFF] ^ (crc >>> 8);
+        crc = (crc ^ 0xFFFFFFFF) >>> 0;
+        var name = bytes(f.name);
+        // version needed, flags, stored, time, date 1980-01-01, crc, sizes, name length, no extra
+        var common = le(20, 2).concat(le(0, 2), le(0, 2), le(0, 2), le(33, 2), le(crc, 4), le(f.data.length, 4),
+                                      le(f.data.length, 4), le(name.length, 2), le(0, 2));
+        parts.push(new Uint8Array(le(0x04034b50, 4).concat(common)), name, f.data);
+        dir.push(new Uint8Array(le(0x02014b50, 4).concat(le(20, 2), common, le(0, 2), le(0, 2), le(0, 2), le(0, 4), le(offset, 4))), name);
+        offset += 30 + name.length + f.data.length;
+    });
+    var dirSize = dir.reduce(function(s, p) { return s + p.length; }, 0);
+    parts = parts.concat(dir, [new Uint8Array(le(0x06054b50, 4).concat(le(0, 2), le(0, 2), le(files.length, 2),
+                                                                   le(files.length, 2), le(dirSize, 4), le(offset, 4), le(0, 2)))]);
+    var out = new Uint8Array(parts.reduce(function(s, p) { return s + p.length; }, 0)), at = 0;
+    parts.forEach(function(p) { out.set(p, at); at += p.length; });
+    return out;
+}
 
 // Rasterize one frame into a 1-bit buffer by stamping discs along each stroke
 function rasterize(strokes, W, H, k) {
