@@ -62,6 +62,7 @@ Rectangle {
     property var live: null             // stroke being drawn, plus items: [Rectangle]
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
+    property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
 
     // Export
     property string statusMessage: ""
@@ -74,6 +75,18 @@ Rectangle {
     readonly property bool canRedo: historyRev >= 0 && !!frame && frame.redo.length > 0
 
     onCurrentChanged: refreshLayers()
+
+    // Latency probe: pen move -> next frame the window has drawn (app side only; the e-ink
+    // panel adds its own refresh on top)
+    Connections {
+        target: root.Window.window
+        function onFrameSwapped() {
+            if (!root.moveWaiting || !root.live) return;
+            var ms = Date.now() - root.moveWaiting, l = root.live;
+            root.moveWaiting = 0;
+            l.lat = (l.lat || 0) + ms; l.frames = (l.frames || 0) + 1; l.latMax = Math.max(l.latMax || 0, ms);
+        }
+    }
     onIsPlayingChanged: refreshLayers()
     onOnionDepthChanged: refreshLayers()
 
@@ -521,6 +534,7 @@ Rectangle {
 
     function moveGesture(pt) {
         var t0 = Date.now();
+        if (live && !moveWaiting) moveWaiting = t0;
         moveGestureImpl(pt);
         var g = live || eraseOp;
         if (g) { g.ms = (g.ms || 0) + Date.now() - t0; g.ev = (g.ev || 0) + 1; }
@@ -565,9 +579,12 @@ Rectangle {
             queueStroke(f, { tool: s.tool, color: s.color, pts: s.pts.slice(live.baked) });
             pushOp({ t: "add", s: s });
             console.log("[Animator][perf] stroke", s.pts.length, "pts,", live.ev || 0, "moves,",
-                        live.ms || 0, "ms JS (", ((live.ms || 0) / Math.max(1, live.ev || 0)).toFixed(1), "ms/move )");
+                        live.ms || 0, "ms JS (", ((live.ms || 0) / Math.max(1, live.ev || 0)).toFixed(1), "ms/move ),",
+                        live.frames || 0, "frames, move->frame avg", ((live.lat || 0) / Math.max(1, live.frames || 0)).toFixed(0),
+                        "ms max", live.latMax || 0, "ms");
         }
         live = null;
+        moveWaiting = 0;
         eraseOp = null;
         liveErasing = false;
     }
@@ -734,10 +751,12 @@ Rectangle {
         }
         Item { id: liveLayer; anchors.fill: parent; z: 1 } // pen preview above the frames
 
-        // Tell xochitl which e-ink waveform to use for this region
+        // Tell xochitl which e-ink waveform to use for this region. UFast puts the live stroke
+        // on the panel noticeably sooner; it's 1-bit, so grey ink settles when Fast takes over
         DisplayMethodArea {
             anchors.fill: parent
-            displayMethod: root.isPlaying ? DisplayMethodArea.Animate : DisplayMethodArea.Fast
+            displayMethod: root.isPlaying ? DisplayMethodArea.Animate
+                         : root.live ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
         }
 
         // The Marker reaches AppLoad apps as plain (non-synthesized) mouse events. Fingers
