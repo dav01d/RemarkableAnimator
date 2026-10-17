@@ -19,16 +19,19 @@ Rectangle {
 
     // ---------------------------------------------------------------
     // MODEL
-    // frames[i] = { key, canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item], dirty, edits }
+    // layers[l] = { name, visible, cels: [drawing | null] }: top layer first, one cel per frame;
+    //             null holds the layer's drawing from an earlier frame
+    // drawing   = { key, canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item], dirty, edits }
     // edits     = [[at, deleteCount, [stroke]]] spliced into strokes since the last save, or null: unsaved as a whole
     // stroke    = { tool, color, pts: [{x, y, w}] }
     // op        = { t: "add", s } | { t: "swap", before: [stroke], after: [stroke] }
     // ---------------------------------------------------------------
-    property var frames: []
+    property var layers: []
+    property int currentLayer: 0
     property int frameCount: 0
     property int current: 0
     property int historyRev: 0 // bumped on every edit so Undo/Redo enablement re-evaluates
-    property int frameKeys: 0  // last frame key handed out; the storage worker caches saved frames by key
+    property int frameKeys: 0  // last drawing key handed out; the storage worker caches saved drawings by key
 
     // Tools
     // One pressure-sensitive pen in three sizes: black to finish, light grey to plan.
@@ -76,13 +79,14 @@ Rectangle {
     property bool showExportModal: false
     property bool isExporting: false
 
-    readonly property var frame: current < frameCount ? frames[current] : null
+    // The drawing under the pen: the current layer's at the current frame (its own or a held one)
+    readonly property var frame: historyRev >= 0 && current < frameCount ? drawingAt(currentLayer, current) : null
     readonly property bool canUndo: historyRev >= 0 && !!frame && frame.undo.length > 0
     readonly property bool canRedo: historyRev >= 0 && !!frame && frame.redo.length > 0
 
     onCurrentChanged: refreshLayers()
     onShowPlanningChanged: {
-        for (var i = 0; i < frames.length; i++) frames[i].full = true;
+        drawings().forEach(d => d.full = true);
         refreshLayers();
     }
 
@@ -102,7 +106,7 @@ Rectangle {
 
     Component.onCompleted: {
         loadSettings();
-        insertFrame(0, null);
+        resetLayers(blankLayers());
         storage.sendMessage({ op: "list", dir: storageDir }); // then reopen the latest animation
     }
 
@@ -133,7 +137,7 @@ Rectangle {
                 root.projectIndex = m.index;
             } else {
                 console.log("[Animator] storage:", m.message);
-                for (var i = 0; i < root.frames.length; i++) root.frames[i].edits = null; // resend everything next save
+                root.drawings().forEach(d => d.edits = null); // resend everything next save
                 if (!root.projectId) root.newProject(); // unreadable save: don't leave the user without a project
             }
         }
@@ -143,20 +147,20 @@ Rectangle {
         if (!projectId) return;
         saveTimer.stop();
         // Handing strokes to the worker copies them on this thread, so send only what changed since
-        // the last save: each frame's edits, or the whole frame when that's fewer points to copy
-        var t0 = Date.now(), order = [], whole = {}, edits = {}, n = 0, pts = 0;
-        for (var i = 0; i < frames.length; i++) {
-            var f = frames[i];
-            order.push(f.key);
+        // the last save: each drawing's edits, or the whole drawing when that's fewer points to copy
+        var t0 = Date.now(), all = drawings(), whole = {}, edits = {}, n = 0, pts = 0;
+        for (var i = 0; i < all.length; i++) {
+            var f = all[i];
             if (f.edits && !f.edits.length) continue;
-            var all = pointCount(f.strokes), changed = f.edits ? f.edits.reduce((c, e) => c + pointCount(e[2]), 0) : Infinity;
-            if (changed < all) { edits[f.key] = f.edits; pts += changed; } else { whole[f.key] = f.strokes; pts += all; }
+            var size = pointCount(f.strokes), changed = f.edits ? f.edits.reduce((c, e) => c + pointCount(e[2]), 0) : Infinity;
+            if (changed < size) { edits[f.key] = f.edits; pts += changed; } else { whole[f.key] = f.strokes; pts += size; }
             f.edits = [];
             n++;
         }
+        var shape = layers.map(l => ({ name: l.name, visible: l.visible, cels: l.cels.map(d => d ? d.key : 0) }));
         storage.sendMessage({ op: "save", dir: storageDir,
-                              project: { id: projectId, name: projectName, fps: fps, order: order, whole: whole, edits: edits } });
-        console.log("[Animator][perf] save handoff", n, "of", order.length, "frames,", pts, "pts,", Date.now() - t0, "ms");
+                              project: { id: projectId, name: projectName, fps: fps, layers: shape, whole: whole, edits: edits } });
+        console.log("[Animator][perf] save handoff", n, "of", all.length, "drawings,", pts, "pts,", Date.now() - t0, "ms");
     }
 
     function pointCount(strokes) { return strokes.reduce((c, s) => c + s.pts.length, 0); }
@@ -165,7 +169,7 @@ Rectangle {
         saveProject();
         projectId = "anim-" + Date.now();
         projectName = "Animation " + (projectIndex.length + 1);
-        resetFrames([[]]);
+        resetLayers(blankLayers());
         showProjects = false;
         saveProject();
     }
@@ -209,27 +213,31 @@ Rectangle {
         projectName = p.name;
         var fi = fpsOptions.indexOf(p.fps);
         if (fi >= 0) fpsIndex = fi;
-        resetFrames(p.frames.length ? p.frames : [[]]);
-        if (p.frames.length) for (var i = 0; i < frames.length; i++) frames[i].edits = []; // the storage worker kept them
+        resetLayers(p.length ? p.layers : blankLayers());
+        if (p.length) drawings().forEach(d => d.edits = []); // the storage worker kept them
         saveProject(); // marks it most recent, so it reopens next launch
     }
 
-    // Replace every frame with the given stroke lists
-    function resetFrames(data) {
+    function blankLayers() { return [{ name: "Layer 1", visible: true, cels: [[]] }]; }
+
+    // Replace every layer with the given ones: [{ name, visible, cels: [strokes | null] }]
+    function resetLayers(data) {
         loading = true;
         isPlaying = false;
-        for (var i = 0; i < frames.length; i++) frames[i].canvas.destroy();
-        frames = [];
-        frameCount = 0;
-        frameKeys = 0; // keys 1..n, as the storage worker keys a project it loads
-        current = 0;
-        for (var j = 0; j < data.length; j++) insertFrame(j, { strokes: data[j] });
+        drawings().forEach(d => d.canvas.destroy());
+        layers = [];
+        frameKeys = 0; // keys 1..n, layer by layer, as the storage worker keys a project it loads
+        for (var l = 0; l < data.length; l++)
+            layers.push({ name: data[l].name, visible: data[l].visible, cels: data[l].cels.map(s => s ? newDrawing(l, s) : null) });
+        currentLayer = 0;
+        frameCount = data[0].cels.length;
         current = 0;
         refreshLayers();
+        historyRev++;
         loading = false;
     }
 
-    // One frame's baked ink
+    // One drawing's baked ink
     Component {
         id: canvasComp
         Canvas {
@@ -256,11 +264,30 @@ Rectangle {
     // ---------------------------------------------------------------
     // FRAMES
     // ---------------------------------------------------------------
+    function newDrawing(l, strokes) {
+        var d = { key: ++frameKeys, strokes: strokes, undo: [], redo: [], queue: [], full: true, trash: [], edits: null };
+        d.canvas = canvasComp.createObject(stage, { z: -0.1 * l }); // upper layers on top, all above the onion skin
+        return d;
+    }
+
+    // The drawing layer l shows at frame i: its own, or the one it holds from an earlier frame
+    function drawingAt(l, i) {
+        var cels = layers[l].cels;
+        while (i >= 0 && !cels[i]) i--;
+        return i >= 0 ? cels[i] : null;
+    }
+
+    function drawings() {
+        var all = [];
+        for (var l = 0; l < layers.length; l++) all = all.concat(layers[l].cels.filter(d => d));
+        return all;
+    }
+
+    // A new frame: a drawing on the current layer (blank or a copy); the other layers hold
     function insertFrame(at, copyFrom) {
-        var f = { key: ++frameKeys, strokes: copyFrom ? copyFrom.strokes.slice() : [], undo: [], redo: [], queue: [], full: true, trash: [], edits: null };
-        f.canvas = canvasComp.createObject(stage);
-        frames.splice(at, 0, f);
-        frameCount = frames.length;
+        for (var l = 0; l < layers.length; l++)
+            layers[l].cels.splice(at, 0, l === currentLayer ? newDrawing(l, copyFrom ? copyFrom.strokes.slice() : []) : null);
+        frameCount = layers[0].cels.length;
         current = at;
         refreshLayers();
         historyRev++;
@@ -268,9 +295,13 @@ Rectangle {
 
     function deleteFrame() {
         if (frameCount <= 1) { clearFrame(); return; }
-        frames[current].canvas.destroy();
-        frames.splice(current, 1);
-        frameCount = frames.length;
+        for (var l = 0; l < layers.length; l++) {
+            var cels = layers[l].cels, d = cels.splice(current, 1)[0];
+            if (!d) continue;
+            if (current < cels.length && !cels[current]) cels[current] = d; // still held in the next frame
+            else d.canvas.destroy();
+        }
+        frameCount = layers[0].cels.length;
         current = Math.min(current, frameCount - 1);
         refreshLayers();
         historyRev++;
@@ -278,7 +309,7 @@ Rectangle {
 
     function moveFrame(from, to) {
         if (from === to) return;
-        frames.splice(to, 0, frames.splice(from, 1)[0]);
+        for (var l = 0; l < layers.length; l++) layers[l].cels.splice(to, 0, layers[l].cels.splice(from, 1)[0]);
         current = to;
         refreshLayers();
         historyRev++; // autosave
@@ -288,11 +319,16 @@ Rectangle {
         if (i >= 0 && i < frameCount) current = i;
     }
 
+    // Show each visible layer's drawing for the current frame
     function refreshLayers() {
-        for (var i = 0; i < frames.length; i++) {
-            var c = frames[i].canvas;
-            c.visible = i === current;
-            if (c.visible && (frames[i].full || frames[i].queue.length)) c.requestPaint();
+        for (var l = 0; l < layers.length; l++) {
+            var shown = layers[l].visible ? drawingAt(l, current) : null, cels = layers[l].cels;
+            for (var i = 0; i < cels.length; i++) {
+                var d = cels[i];
+                if (!d) continue;
+                d.canvas.visible = d === shown;
+                if (d.canvas.visible && (d.full || d.queue.length)) d.canvas.requestPaint();
+            }
         }
         onionCanvas.requestPaint();
     }
@@ -345,8 +381,7 @@ Rectangle {
     // Looked up rather than stored on the Canvas: a JS object assigned to a QML
     // property is copied, so the Canvas would see a stale snapshot
     function frameOf(c) {
-        for (var i = 0; i < frames.length; i++) if (frames[i].canvas === c) return frames[i];
-        return null;
+        return drawings().find(d => d.canvas === c) || null;
     }
 
     // Draws onto the frame's image: everything after undo/clear, only the dirty area after
@@ -388,16 +423,18 @@ Rectangle {
         if (ms > 10) console.log("[Animator][perf] paint", mode, drawn, "strokes", ms, "ms");
     }
 
-    // Onion skin: earlier frames drawn in lighter greys, each step back half as dark
-    // (50%, 25%, 12.5%). Baked as solid colors because item opacity is unreliable on e-paper.
+    // Onion skin: the current layer's earlier drawings in lighter greys, each step back half as
+    // dark (50%, 25%, 12.5%). Baked as solid colors because item opacity is unreliable on e-paper.
     function paintOnion(c) {
         var ctx = c.getContext("2d");
-        if (!ctx) return;
+        if (!ctx || !frameCount) return;
         ctx.clearRect(0, 0, c.width, c.height);
-        for (var back = onionDepth; back >= 1; back--) {
-            var f = frames[current - back];
-            if (!f) continue;
-            for (var i = 0; i < f.strokes.length; i++) drawStroke(ctx, f.strokes[i], Math.pow(0.5, back));
+        var cels = layers[currentLayer].cels, i = current, earlier = [];
+        while (i >= 0 && !cels[i]) i--; // where the drawing on screen starts
+        while (--i >= 0 && earlier.length < onionDepth) if (cels[i]) earlier.push(cels[i]);
+        for (var back = earlier.length; back >= 1; back--) {
+            var f = earlier[back - 1];
+            for (var k = 0; k < f.strokes.length; k++) drawStroke(ctx, f.strokes[k], Math.pow(0.5, back));
         }
     }
 
@@ -1188,7 +1225,14 @@ Rectangle {
     function runExportPipeline() {
         var W = 480, k = W / stage.width, H = Math.round(stage.height * k);
         var strokes = [];
-        for (var f = 0; f < frames.length; f++) strokes.push(frames[f].strokes.filter(s => !isPlanning(s))); // finished ink only
+        for (var f = 0; f < frameCount; f++) {
+            var ink = [];
+            for (var l = layers.length - 1; l >= 0; l--) { // bottom layer first
+                var d = layers[l].visible ? drawingAt(l, f) : null;
+                if (d) ink = ink.concat(d.strokes.filter(s => !isPlanning(s))); // finished ink only
+            }
+            strokes.push(ink);
+        }
         exportWorker.sendMessage({ frames: strokes, W: W, H: H, k: k, fps: fps });
     }
 
