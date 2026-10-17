@@ -4,7 +4,9 @@
 // Strokes are stored compactly: { t: tool, c: color, p: [x, y, w, x, y, w, ...] }.
 //
 // Messages in:  { op: "list", dir } | { op: "load", dir, id }
-//               | { op: "save", dir, project: { id, name, fps, order: [key], changed: { key: strokes } } }
+//               | { op: "save", dir, project: { id, name, fps, order: [key], whole: { key: strokes },
+//                                             edits: { key: [[at, deleteCount, strokes]] } } }
+// A loaded project's frames are keyed 1..n, as the UI keys them.
 // Messages out: { op: "list", index } | { op: "loaded", project } | { op: "saved", index }
 //               | { op: "error", message }
 
@@ -55,6 +57,8 @@ WorkerScript.onMessage = function(msg) {
         request("GET", msg.dir + "/" + msg.id + ".json", null, function(text) {
             try {
                 var project = JSON.parse(text);
+                saved = { id: project.id, frames: {} };
+                for (var i = 0; i < project.frames.length; i++) saved.frames[i + 1] = project.frames[i];
                 project.frames = unpack(project.frames);
                 WorkerScript.sendMessage({ op: "loaded", project: project });
             } catch (e) {
@@ -64,7 +68,12 @@ WorkerScript.onMessage = function(msg) {
     } else if (msg.op === "save") {
         var p = msg.project, frames = [], kept = {};
         if (saved.id !== p.id) saved = { id: p.id, frames: {} };
-        for (var key in p.changed) saved.frames[key] = pack(p.changed[key]);
+        for (var key in p.whole) saved.frames[key] = pack(p.whole[key]);
+        for (key in p.edits) {
+            var f = saved.frames[key];
+            if (!f) { WorkerScript.sendMessage({ op: "error", message: "Couldn't save" }); return; }
+            p.edits[key].forEach(function(e) { f.splice.apply(f, [e[0], e[1]].concat(pack(e[2]))); });
+        }
         for (var i = 0; i < p.order.length; i++) {
             var f = saved.frames[p.order[i]];
             if (!f) { WorkerScript.sendMessage({ op: "error", message: "Couldn't save" }); return; }
