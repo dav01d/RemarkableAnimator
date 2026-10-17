@@ -5,7 +5,7 @@
 //   (version 1 had frames: [strokes] in place of length and layers; it loads as one layer)
 // Strokes are stored compactly: { t: tool, c: color, p: [x, y, w, x, y, w, ...] }.
 //
-// Messages in:  { op: "list", dir } | { op: "load", dir, id }
+// Messages in:  { op: "list", dir } | { op: "load", dir, id } | { op: "delete", dir, id } (replies "list")
 //               | { op: "save", dir, project: { id, name, fps, layers: [{ name, visible, cels: [key | 0] }],
 //                                             whole: { key: strokes }, edits: { key: [[at, deleteCount, strokes]] } } }
 // A loaded project's drawings are keyed 1..n, layer by layer, as the UI keys them.
@@ -76,6 +76,17 @@ WorkerScript.onMessage = function(msg) {
             } catch (e) {
                 failed("Couldn't open that animation");
             }
+        });
+    } else if (msg.op === "delete") {
+        if (saved.id === msg.id) saved = { id: "", drawings: {} };
+        // XMLHttpRequest can't remove a file: empty it and drop it from the index
+        request("PUT", msg.dir + "/" + msg.id + ".json", "", function() {
+            readIndex(msg.dir, function(index) {
+                index = index.filter(function(e) { return e.id !== msg.id; });
+                request("PUT", msg.dir + "/index.json", JSON.stringify(index), function() {
+                    WorkerScript.sendMessage({ op: "list", index: index });
+                });
+            });
         });
     } else if (msg.op === "save") {
         var p = msg.project, layers = [], kept = {}, length = p.layers[0].cels.length;
