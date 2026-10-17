@@ -48,6 +48,7 @@ Rectangle {
     // Playback
     property bool isPlaying: false
     property int onionDepth: 2          // how many previous frames show through (0 = off)
+    readonly property string nextInk: "#2060c0" // the next drawing's onion skin (blue on colour panels)
     property var fpsOptions: [6, 8, 12, 24]
     property int fpsIndex: 2
     readonly property int fps: fpsOptions[fpsIndex]
@@ -498,7 +499,8 @@ Rectangle {
     }
 
     // Onion skin: the current layer's earlier drawings in lighter greys, each step back half as
-    // dark (50%, 25%, 12.5%). Baked as solid colors because item opacity is unreliable on e-paper.
+    // dark (50%, 25%, 12.5%), and its next drawing in light blue. Baked as solid colors because
+    // item opacity is unreliable on e-paper.
     function paintOnion(c) {
         var ctx = c.getContext("2d");
         if (!ctx || !frameCount) return;
@@ -510,6 +512,8 @@ Rectangle {
             var f = earlier[back - 1];
             for (var k = 0; k < f.strokes.length; k++) drawStroke(ctx, f.strokes[k], Math.pow(0.5, back));
         }
+        var next = cels.slice(current + 1).find(d => d);
+        if (next) for (var n = 0; n < next.strokes.length; n++) drawStroke(ctx, next.strokes[n], 0.5, nextInk);
     }
 
     // Blend a #rrggbb color toward white, keeping `strength` of its darkness
@@ -525,9 +529,9 @@ Rectangle {
     // Any ink but black is planning (older animations used a darker grey)
     function isPlanning(s) { return s.color !== "#000000"; }
 
-    function drawStroke(ctx, s, strength) {
+    function drawStroke(ctx, s, strength, tint) {
         if (!showPlanning && isPlanning(s)) return;
-        var pts = s.pts, color = strength ? fade(s.color, strength) : s.color;
+        var pts = s.pts, color = strength ? fade(tint || s.color, strength) : s.color;
         ctx.globalCompositeOperation = s.tool === "area" ? "destination-out" : "source-over";
         ctx.strokeStyle = color;
         ctx.fillStyle = color;
