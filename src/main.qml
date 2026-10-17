@@ -828,7 +828,7 @@ Rectangle {
             }
         }
         TapHandler {
-            acceptedDevices: PointerDevice.Mouse // the pen only: palms and fingers are touch
+            acceptedDevices: PointerDevice.AllDevices & ~PointerDevice.TouchScreen // palms and fingers are touch; the pen is mouse or stylus to Qt
             gesturePolicy: TapHandler.ReleaseWithinBounds
             onTapped: btn.tap()
             onLongPressed: btn.hold()
@@ -936,7 +936,7 @@ Rectangle {
             text: root.projectName
             font.pixelSize: 24; font.bold: true
             elide: Text.ElideRight
-            TapHandler { acceptedDevices: PointerDevice.Mouse; onTapped: root.startRename() }
+            TapHandler { acceptedDevices: PointerDevice.AllDevices & ~PointerDevice.TouchScreen; onTapped: root.startRename() }
         }
         Row {
             id: rightGroup
@@ -1404,7 +1404,7 @@ Rectangle {
                 Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: "#aaaaaa" }
                 Item { // tap the row to open it; the trash keeps its own taps
                     width: trash.x; height: parent.height
-                    TapHandler { acceptedDevices: PointerDevice.Mouse; onTapped: root.openProject(modelData.id) }
+                    TapHandler { acceptedDevices: PointerDevice.AllDevices & ~PointerDevice.TouchScreen; onTapped: root.openProject(modelData.id) }
                 }
                 Btn {
                     id: trash
