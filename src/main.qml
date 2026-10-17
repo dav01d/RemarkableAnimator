@@ -1252,7 +1252,7 @@ Rectangle {
                 onTap: root.showPlanning = !root.showPlanning
             }
             Btn { label: root.fps + " fps"; flat: true; onTap: root.fpsIndex = (root.fpsIndex + 1) % root.fpsOptions.length }
-            Btn { label: "Clear"; flat: true; onTap: root.clearFrame() }
+            Btn { label: "Clear"; flat: true; visible: !delBtn.armed && !holdBtn.armed; onTap: root.clearFrame() } // makes room for "Sure?" so the bar never wraps
         }
     }
 
