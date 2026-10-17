@@ -11,6 +11,7 @@ running inside xochitl (the reMarkable UI), plus a tiny native backend for pen p
 | `src/StorageWorker.js` | Saves, loads and lists projects as JSON (WorkerScript thread) |
 | `src/QrCode.js` | QR code generator (byte mode, level M) for the share screen |
 | `backend/pen.c` → `src/backend/entry` | Streams Marker pressure, tilt and eraser end to the frontend |
+| `backend/share.c` (in the same binary) | Wi-Fi share: serves the latest export over HTTP on port 8765 for 10 minutes and reports the link |
 
 ## What the platform taught us
 | Behaviour on the tablet (OS 3.28) | How the app handles it |
@@ -25,6 +26,7 @@ running inside xochitl (the reMarkable UI), plus a tiny native backend for pen p
 | AppLoad logs a line for every backend message. | The backend sends only real pressure changes (≥1.5%, at most every 15 ms) and nothing while hovering. |
 | AppLoad caches an app's `resources.rcc` until xochitl restarts; a reboot drops XOVI (its hook lives on tmpfs). | Deploying is copy, close the app, restart xochitl (`deploy.ps1 -Restart`). If AppLoad disappears after a reboot, run `/home/root/xovi/start`. |
 | AppLoad's virtual keyboard only serves framebuffer apps. | Rename has its own on-screen keyboard. |
+| QML can't listen on a socket. | The Wi-Fi share writes the export next to the projects and asks the backend (message 2) to serve it; the backend answers with `http://<Wi-Fi IP>:8765/<file>`, which the QR code shows. Its sockets are non-blocking and live in the pen's poll loop, so a phone never stalls the pen. |
 
 ## Data
 Projects live in `/home/root/.local/share/remarkable-animator/`: `index.json` lists them (with a

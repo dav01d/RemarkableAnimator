@@ -63,6 +63,7 @@ Rectangle {
         id: penBackend
         applicationID: "remarkable-animator"
         onMessageReceived: (type, contents) => {
+            if (type === 2) return root.wifiShared(contents); // the Wi-Fi share's link, or why it failed
             if (type !== 1) return;
             var v = contents.split(" "); // "pressure tiltX tiltY eraser touching"
             root.penPressure = v[0] / 1000;
@@ -85,6 +86,7 @@ Rectangle {
                                             svg: { label: "Animated SVG", file: "flipbook.svg", type: "image/svg+xml" },
                                             zip: { label: "SVG frames", file: "flipbook-svg.zip", type: "application/zip" },
                                             pdf: { label: "PDF flipbook", file: "flipbook.pdf", type: "application/pdf" } })
+    property bool shareWifi: false      // serve the export from the tablet on Wi-Fi instead of uploading it
     property bool showExportModal: false
     property bool isExporting: false
 
@@ -1491,13 +1493,21 @@ Rectangle {
                     wrapMode: Text.WrapAnywhere
                 }
 
+                Row { // where the link points: an upload, or the tablet itself on Wi-Fi
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    spacing: 12
+                    visible: !root.exportFormat
+                    Btn { label: "Upload link"; on: !root.shareWifi; onTap: root.shareWifi = false }
+                    Btn { label: "Wi-Fi (no cloud)"; on: root.shareWifi; onTap: root.shareWifi = true }
+                }
+
                 Row { // pick a format
                     anchors.horizontalCenter: parent.horizontalCenter
                     spacing: 12
                     visible: !root.exportFormat
                     Repeater {
                         model: ["gif", "svg", "zip", "pdf"]
-                        Btn { label: root.exportFormats[modelData].label; on: index === 0; onTap: root.startExport(modelData) }
+                        Btn { label: root.exportFormats[modelData].label; onTap: root.startExport(modelData) }
                     }
                 }
 
@@ -1577,6 +1587,7 @@ Rectangle {
     }
 
     function upload(fileBytes) {
+        if (shareWifi) return shareOnWifi(fileBytes);
         var format = exportFormats[exportFormat], uploader = JSON.parse(uploaderJson);
         statusMessage = "Uploading " + format.label + "...";
         var boundary = "----AnimatorBoundary" + Math.random().toString(36).substring(2);
@@ -1619,5 +1630,36 @@ Rectangle {
             qrCanvas.requestPaint();
         };
         xhr.send(payload.buffer);
+    }
+
+    // Wi-Fi share: QML can't listen on a socket, so the pen backend serves the file
+    // (backend/share.c). Write it where the backend can read it, then ask for the link.
+    function shareOnWifi(fileBytes) {
+        var format = exportFormats[exportFormat], file = storageDir + "/" + format.file;
+        statusMessage = "Starting the Wi-Fi share...";
+        var xhr = new XMLHttpRequest();
+        xhr.open("PUT", file);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            penBackend.sendMessage(2, format.type + " " + decodeURIComponent(file.replace(/^file:\/\//, "")));
+            shareTimeout.start();
+        };
+        xhr.send(new Uint8Array(fileBytes).buffer);
+    }
+
+    function wifiShared(reply) {
+        shareTimeout.stop();
+        isExporting = false;
+        var ok = reply.indexOf("http") === 0;
+        exportedUrl = ok ? reply : "";
+        statusMessage = ok ? "On the same Wi-Fi, scan with your phone. The link works for 10 minutes while Animator stays open:"
+                           : reply; // SHARE_TIMEOUT_MS in backend/share.h
+        qrCanvas.requestPaint();
+    }
+
+    Timer {
+        id: shareTimeout
+        interval: 5000
+        onTriggered: { root.isExporting = false; root.statusMessage = "The tablet's share server didn't answer"; }
     }
 }
