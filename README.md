@@ -5,6 +5,16 @@ back on the tablet, and share them to your phone via QR code.
 
 <p align="center"><img src="docs/images/drawing.png" width="480" alt="Animator on the tablet: a bouncing ball on its own layer over a held ground layer, with onion skin showing the previous frames in grey and the next one in blue"></p>
 
+## Examples
+Drawn and exported on the tablet with Animator: the same 18-frame animation as a GIF and as an
+animated SVG (the SVG stays sharp at any size).
+
+<p align="center">
+  <img src="docs/examples/waking-up.gif" width="480" alt="Example GIF: a sketched animal curled up asleep wakes, lifts its head and looks at a ball">
+  <br><br>
+  <img src="docs/examples/waking-up.svg" width="480" alt="The same animation as an animated SVG">
+</p>
+
 ## Features
 - Pressure-sensitive pen in 3 sizes; flip the Marker (or tap the eraser button) to erase
 - Black ink for finished lines, light grey for roughs (exports leave grey out). Or sketch on its
