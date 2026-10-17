@@ -1555,9 +1555,11 @@ Rectangle {
     }
 
     // Where Export uploads: catbox.moe by default (anonymous, no key). A tablet can override it
-    // in <storageDir>/settings.json: { "upload": { "url": "...", "field": "...", "params": {} } }
-    property var uploader: ({ url: "https://catbox.moe/user/api.php", field: "fileToUpload",
-                              params: { reqtype: "fileupload" } })
+    // in <storageDir>/settings.json: { "upload": { "url": "...", "field": "...", "params": {} } }.
+    // Kept as JSON text and parsed per upload: the tablet's Qt can lose objects nested in a QML
+    // property, which dropped catbox's reqtype field (it answered HTTP 412)
+    property string uploaderJson: JSON.stringify({ url: "https://catbox.moe/user/api.php", field: "fileToUpload",
+                                                   params: { reqtype: "fileupload" } })
 
     function loadSettings() {
         var xhr = new XMLHttpRequest();
@@ -1565,7 +1567,7 @@ Rectangle {
             if (xhr.readyState !== XMLHttpRequest.DONE || !xhr.responseText) return;
             try {
                 var u = JSON.parse(xhr.responseText).upload;
-                if (u && u.url) root.uploader = { url: u.url, field: u.field || "file", params: u.params || {} };
+                if (u && u.url) root.uploaderJson = JSON.stringify({ url: u.url, field: u.field || "file", params: u.params || {} });
             } catch (e) {
                 console.log("[Animator] ignoring unreadable settings.json:", e);
             }
@@ -1575,7 +1577,7 @@ Rectangle {
     }
 
     function upload(fileBytes) {
-        var format = exportFormats[exportFormat];
+        var format = exportFormats[exportFormat], uploader = JSON.parse(uploaderJson);
         statusMessage = "Uploading " + format.label + "...";
         var boundary = "----AnimatorBoundary" + Math.random().toString(36).substring(2);
         var head = "";
@@ -1598,7 +1600,15 @@ Rectangle {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
             root.isExporting = false;
             if (xhr.status !== 200 && xhr.status !== 201) {
-                root.statusMessage = xhr.status ? "Upload error (HTTP " + xhr.status + ")" : "Network error: couldn't reach the upload server";
+                // Name the server and quote its reply: a refusal from the tablet (e.g. 412) is otherwise a mystery
+                var host = uploader.url.split("/")[2];
+                console.log("[Animator] upload to", uploader.url, "failed: HTTP", xhr.status, "
+" +
+                            xhr.getAllResponseHeaders() + "
+" + xhr.responseText.slice(0, 2000));
+                root.statusMessage = xhr.status ? "Upload error (HTTP " + xhr.status + " from " + host + "): " +
+                                                  xhr.responseText.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160)
+                                                : "Network error: couldn't reach " + host;
                 return;
             }
             var match = xhr.responseText.match(/https?:\/\/[^\s'"\\,}]+/);
