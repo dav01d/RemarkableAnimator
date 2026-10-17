@@ -1,16 +1,23 @@
 # RemarkableAnimator
 
 Flipbook animation **on** the reMarkable Paper Pro Move: draw frames with the Marker, play them
-back on the tablet, and share them as a GIF via QR code.
+back on the tablet, and share them to your phone via QR code.
 
 ## Features
-- Pressure-sensitive pen (3 sizes, black/grey); flip the Marker to erase what you rub over
-- Frames with fading onion skin, drag-to-reorder, playback at 6–24 fps
-- Undo/redo, rename, a Projects screen; everything autosaves on the tablet (works offline)
-- Export the current animation as a GIF, uploaded to [catbox.moe](https://catbox.moe) and
-  shared via a QR code (only when you tap Export)
-- Or share it over Wi-Fi with no cloud: the tablet serves the file itself for 10 minutes, and the
-  QR code points at it (your phone must be on the same network)
+- Pressure-sensitive pen in 3 sizes; flip the Marker (or tap the eraser button) to erase
+- Black ink for finished lines, light planning ink for roughs: **Plan** hides it, and exports
+  always leave it out
+- Up to 3 layers with names; a layer can **Hold** a drawing across frames instead of redrawing it
+- Onion skin: earlier drawings in fading grey, the next one in light blue
+- Timeline and project list with thumbnails; drag frames to reorder; playback at 6–24 fps
+- Undo/redo, rename, delete; everything autosaves on the tablet (works offline)
+- Palm rejection: a resting hand can't draw or press buttons
+- Share as a GIF, an animated SVG, a zip of SVG frames, or a PDF flipbook (one page per frame,
+  which your phone can send on to the reMarkable app). Two ways to get it to your phone:
+  - **Upload link:** uploaded to [catbox.moe](https://catbox.moe) and shared via a QR code
+    (only when you share)
+  - **Wi-Fi (no cloud):** the tablet serves the file itself for 10 minutes, and the QR code
+    points at it (your phone must be on the same network)
 
 ## What you need
 - A reMarkable Paper Pro Move on software version 3.28
