@@ -27,7 +27,9 @@ Rectangle {
     // op        = { t: "add", s } | { t: "swap", before: [stroke], after: [stroke] }
     // ---------------------------------------------------------------
     property var layers: []
+    property int layerCount: 0
     property int currentLayer: 0
+    readonly property int maxLayers: 3
     property int frameCount: 0
     property int current: 0
     property int historyRev: 0 // bumped on every edit so Undo/Redo enablement re-evaluates
@@ -85,6 +87,7 @@ Rectangle {
     readonly property bool canRedo: historyRev >= 0 && !!frame && frame.redo.length > 0
 
     onCurrentChanged: refreshLayers()
+    onCurrentLayerChanged: refreshLayers()
     onShowPlanningChanged: {
         drawings().forEach(d => d.full = true);
         refreshLayers();
@@ -228,7 +231,8 @@ Rectangle {
         layers = [];
         frameKeys = 0; // keys 1..n, layer by layer, as the storage worker keys a project it loads
         for (var l = 0; l < data.length; l++)
-            layers.push({ name: data[l].name, visible: data[l].visible, cels: data[l].cels.map(s => s ? newDrawing(l, s) : null) });
+            layers.push({ name: data[l].name, visible: data[l].visible, cels: data[l].cels.map(s => s ? newDrawing(s) : null) });
+        layerCount = layers.length;
         currentLayer = 0;
         frameCount = data[0].cels.length;
         current = 0;
@@ -264,10 +268,16 @@ Rectangle {
     // ---------------------------------------------------------------
     // FRAMES
     // ---------------------------------------------------------------
-    function newDrawing(l, strokes) {
+    function newDrawing(strokes) {
         var d = { key: ++frameKeys, strokes: strokes, undo: [], redo: [], queue: [], full: true, trash: [], edits: null };
-        d.canvas = canvasComp.createObject(stage, { z: -0.1 * l }); // upper layers on top, all above the onion skin
+        d.canvas = canvasComp.createObject(stage);
         return d;
+    }
+
+    // A layer always starts with a drawing: if its first frame became a hold, its first drawing moves there
+    function keepFirstDrawing(l) {
+        var cels = layers[l].cels, i = cels.findIndex(d => d);
+        if (i > 0) { cels[0] = cels[i]; cels[i] = null; }
     }
 
     // The drawing layer l shows at frame i: its own, or the one it holds from an earlier frame
@@ -285,8 +295,10 @@ Rectangle {
 
     // A new frame: a drawing on the current layer (blank or a copy); the other layers hold
     function insertFrame(at, copyFrom) {
-        for (var l = 0; l < layers.length; l++)
-            layers[l].cels.splice(at, 0, l === currentLayer ? newDrawing(l, copyFrom ? copyFrom.strokes.slice() : []) : null);
+        for (var l = 0; l < layers.length; l++) {
+            layers[l].cels.splice(at, 0, l === currentLayer ? newDrawing(copyFrom ? copyFrom.strokes.slice() : []) : null);
+            keepFirstDrawing(l);
+        }
         frameCount = layers[0].cels.length;
         current = at;
         refreshLayers();
@@ -300,6 +312,7 @@ Rectangle {
             if (!d) continue;
             if (current < cels.length && !cels[current]) cels[current] = d; // still held in the next frame
             else d.canvas.destroy();
+            keepFirstDrawing(l);
         }
         frameCount = layers[0].cels.length;
         current = Math.min(current, frameCount - 1);
@@ -309,10 +322,51 @@ Rectangle {
 
     function moveFrame(from, to) {
         if (from === to) return;
-        for (var l = 0; l < layers.length; l++) layers[l].cels.splice(to, 0, layers[l].cels.splice(from, 1)[0]);
+        for (var l = 0; l < layers.length; l++) {
+            layers[l].cels.splice(to, 0, layers[l].cels.splice(from, 1)[0]);
+            keepFirstDrawing(l);
+        }
         current = to;
         refreshLayers();
         historyRev++; // autosave
+    }
+
+    // Hold: the current layer keeps showing its earlier drawing here. Draw: a drawing of its own,
+    // starting as a copy of the held one.
+    function toggleHold() {
+        var cels = layers[currentLayer].cels, d = cels[current];
+        if (current === 0) return; // a layer always starts with a drawing
+        if (d) { d.canvas.destroy(); cels[current] = null; }
+        else cels[current] = newDrawing(frame.strokes.slice());
+        refreshLayers();
+        historyRev++;
+    }
+
+    // A new layer goes on top, with one blank drawing held through the whole animation
+    function addLayer() {
+        if (layers.length >= maxLayers) return;
+        var cels = [newDrawing([])];
+        for (var i = 1; i < frameCount; i++) cels.push(null);
+        layers.unshift({ name: "Layer " + (layers.length + 1), visible: true, cels: cels });
+        layerCount = layers.length;
+        currentLayer = 0;
+        refreshLayers();
+        historyRev++;
+    }
+
+    function deleteLayer(l) {
+        if (layers.length <= 1) return;
+        layers.splice(l, 1)[0].cels.forEach(d => d && d.canvas.destroy());
+        layerCount = layers.length;
+        currentLayer = Math.min(currentLayer, layerCount - 1);
+        refreshLayers();
+        historyRev++;
+    }
+
+    function toggleLayer(l) {
+        layers[l].visible = !layers[l].visible;
+        refreshLayers();
+        historyRev++;
     }
 
     function goTo(i) {
@@ -326,6 +380,7 @@ Rectangle {
             for (var i = 0; i < cels.length; i++) {
                 var d = cels[i];
                 if (!d) continue;
+                d.canvas.z = -0.1 * l; // upper layers on top, all above the onion skin
                 d.canvas.visible = d === shown;
                 if (d.canvas.visible && (d.full || d.queue.length)) d.canvas.requestPaint();
             }
@@ -682,6 +737,7 @@ Rectangle {
         property bool enabledLook: true
         readonly property color ink: on ? "white" : (enabledLook ? "black" : "#aaaaaa")
         signal tap
+        signal hold
         width: Math.max(60, content.implicitWidth + 26)
         height: 58
         radius: 8
@@ -711,6 +767,7 @@ Rectangle {
             acceptedDevices: PointerDevice.Mouse // the pen only: palms and fingers are touch
             gesturePolicy: TapHandler.ReleaseWithinBounds
             onTapped: btn.tap()
+            onLongPressed: btn.hold()
         }
     }
 
@@ -759,6 +816,8 @@ Rectangle {
             case "eye":
                 c.moveTo(4, 18); c.quadraticCurveTo(18, 4, 32, 18); c.quadraticCurveTo(18, 32, 4, 18);
                 c.moveTo(23, 18); c.arc(18, 18, 5, 0, 2 * Math.PI); break;
+            case "hold": // a drawing held along the timeline
+                c.rect(4, 11, 14, 14); c.moveTo(18, 18); c.lineTo(32, 18); break;
             case "close": c.moveTo(9, 9); c.lineTo(27, 27); c.moveTo(27, 9); c.lineTo(9, 27); break;
             case "projects": c.rect(6, 6, 10, 10); c.rect(20, 6, 10, 10); c.rect(6, 20, 10, 10); c.rect(20, 20, 10, 10); break;
             case "share": // arrow up out of a tray
@@ -911,70 +970,143 @@ Rectangle {
 
         Rectangle { width: parent.width; height: 2; color: "black" }
 
-        ListView {
-            id: strip
+        Row {
             width: parent.width
-            height: 64
-            orientation: ListView.Horizontal
-            spacing: 6
-            leftMargin: 8; rightMargin: 8
-            model: root.frameCount
-            currentIndex: root.current
-            onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
 
-            // Press and hold a frame, then drag it left/right to retime the animation
-            property int dragFrom: -1
-            property int dragTo: -1
-            property int scrollSlop: 24 // px the pen may wander during a hold before it scrolls instead
-            interactive: false // the pen scrolls it below; a palm mustn't
-
-            delegate: Rectangle {
-                y: 6
-                width: 52; height: 52; radius: 6
-                color: index === strip.dragFrom ? "#bbbbbb" : index === root.current ? "black" : "white"
-                border.color: "black"
-                border.width: strip.dragFrom >= 0 && index === strip.dragTo ? 6 : 2
-                Text {
-                    anchors.centerIn: parent
-                    text: index + 1
-                    font.pixelSize: 20; font.bold: true
-                    color: index === root.current && index !== strip.dragFrom ? "white" : "black"
-                }
-                // The pen jitters past Qt's drag distance (~1 mm here) before a hold fires, which
-                // let the ListView steal the press. Keep the press and scroll the strip ourselves.
-                MouseArea {
-                    anchors.fill: parent
-                    pressAndHoldInterval: 350
-                    preventStealing: true
-                    property real pressX
-                    property real pressContentX
-                    property bool scrolling: false
-                    onPressed: (m) => {
-                        if (m.source !== Qt.MouseEventNotSynthesized) { m.accepted = false; return; } // palm
-                        pressX = mapToItem(strip, m.x, 0).x;
-                        pressContentX = strip.contentX;
-                        scrolling = false;
-                    }
-                    onClicked: if (!scrolling) root.goTo(index)
-                    onPressAndHold: if (!scrolling) { strip.dragFrom = index; strip.dragTo = index; }
-                    onPositionChanged: (m) => {
-                        if (strip.dragFrom < 0) {
-                            var dx = mapToItem(strip, m.x, 0).x - pressX;
-                            if (Math.abs(dx) > strip.scrollSlop) scrolling = true;
-                            if (!scrolling) return;
-                            var minX = strip.originX - strip.leftMargin;
-                            var maxX = Math.max(minX, strip.originX + strip.contentWidth + strip.rightMargin - strip.width);
-                            strip.contentX = Math.max(minX, Math.min(maxX, pressContentX - dx));
-                            return;
+            // One header per layer: tap to draw on it, hold to delete it; the eye hides it
+            Column {
+                id: layerHeads
+                topPadding: 6; leftPadding: 8
+                spacing: 6
+                Repeater {
+                    model: root.layerCount
+                    Row {
+                        spacing: 2
+                        Btn {
+                            id: layerBtn
+                            property bool armed: false
+                            width: 106; height: 52
+                            label: armed ? "Delete?" : root.historyRev >= 0 && root.layers[index] ? root.layers[index].name : ""
+                            on: index === root.currentLayer || armed
+                            onTap: {
+                                if (armed) { armed = false; root.deleteLayer(index); }
+                                else root.currentLayer = index;
+                            }
+                            onHold: if (root.layerCount > 1) { armed = true; disarmLayer.restart(); }
+                            Timer { id: disarmLayer; interval: 3000; onTriggered: layerBtn.armed = false }
                         }
-                        var p = mapToItem(strip.contentItem, m.x, m.y);
-                        strip.dragTo = Math.max(0, Math.min(root.frameCount - 1, Math.floor((p.x + 3) / 58)));
+                        Btn {
+                            width: 44; height: 52; flat: true
+                            icon: root.historyRev >= 0 && root.layers[index] && root.layers[index].visible ? "eye" : "eye-off"
+                            onTap: root.toggleLayer(index)
+                        }
                     }
-                    onReleased: {
-                        if (strip.dragFrom >= 0) root.moveFrame(strip.dragFrom, strip.dragTo);
-                        strip.dragFrom = -1;
+                }
+                Btn {
+                    visible: root.layerCount < root.maxLayers
+                    width: 152; height: 40
+                    label: "+ Layer"
+                    onTap: root.addLayer()
+                }
+            }
+
+            ListView {
+                id: strip
+                width: parent.width - layerHeads.width
+                height: layerHeads.height
+                orientation: ListView.Horizontal
+                spacing: 6
+                leftMargin: 8; rightMargin: 8
+                model: root.frameCount
+                currentIndex: root.current
+                onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
+
+                // Press and hold a frame, then drag it left/right to retime the animation
+                property int dragFrom: -1
+                property int dragTo: -1
+                property int scrollSlop: 24 // px the pen may wander during a hold before it scrolls instead
+                interactive: false // the pen scrolls it below; a palm mustn't
+
+                // One column per frame, one cell per layer: a numbered box where a drawing starts,
+                // a line where the layer holds it
+                delegate: Item {
+                    id: column
+                    property int frameIndex: index
+                    y: 6
+                    width: 52; height: root.layerCount * 58 - 6
+                    Repeater {
+                        model: root.layerCount
+                        Item {
+                            readonly property var cels: root.historyRev >= 0 && root.layers[index] ? root.layers[index].cels : []
+                            readonly property bool drawn: root.historyRev >= 0 && !!cels[column.frameIndex] // same array after edits: re-read on each
+                            readonly property bool here: column.frameIndex === root.current
+                            readonly property bool mine: here && index === root.currentLayer
+                            y: index * 58
+                            width: 52; height: 52
+                            Rectangle { // held: the drawing carries on
+                                visible: !parent.drawn
+                                x: -3; width: 58; height: 4
+                                anchors.verticalCenter: parent.verticalCenter
+                                color: "black"
+                            }
+                            Rectangle {
+                                visible: parent.drawn || parent.here
+                                anchors.fill: parent; radius: 6
+                                color: column.frameIndex === strip.dragFrom ? "#bbbbbb" : parent.mine && parent.drawn ? "black"
+                                     : parent.drawn ? "white" : "transparent"
+                                border.color: "black"
+                                border.width: strip.dragFrom >= 0 && column.frameIndex === strip.dragTo ? 6 : parent.here ? 4 : 2
+                                Text {
+                                    anchors.centerIn: parent
+                                    visible: parent.parent.drawn
+                                    // the drawing's number within its layer
+                                    text: root.historyRev >= 0 && parent.parent.cels.slice(0, column.frameIndex + 1).filter(d => d).length
+                                    font.pixelSize: 20; font.bold: true
+                                    color: parent.parent.mine && column.frameIndex !== strip.dragFrom ? "white" : "black"
+                                }
+                            }
+                        }
                     }
-                    onCanceled: strip.dragFrom = -1
+                    // The pen jitters past Qt's drag distance (~1 mm here) before a hold fires, which
+                    // let the ListView steal the press. Keep the press and scroll the strip ourselves.
+                    MouseArea {
+                        anchors.fill: parent
+                        pressAndHoldInterval: 350
+                        preventStealing: true
+                        property real pressX
+                        property real pressContentX
+                        property bool scrolling: false
+                        onPressed: (m) => {
+                            if (m.source !== Qt.MouseEventNotSynthesized) { m.accepted = false; return; } // palm
+                            pressX = mapToItem(strip, m.x, 0).x;
+                            pressContentX = strip.contentX;
+                            scrolling = false;
+                        }
+                        onClicked: (m) => {
+                            if (scrolling) return;
+                            root.goTo(index);
+                            root.currentLayer = Math.max(0, Math.min(root.layerCount - 1, Math.floor(m.y / 58)));
+                        }
+                        onPressAndHold: if (!scrolling) { strip.dragFrom = index; strip.dragTo = index; }
+                        onPositionChanged: (m) => {
+                            if (strip.dragFrom < 0) {
+                                var dx = mapToItem(strip, m.x, 0).x - pressX;
+                                if (Math.abs(dx) > strip.scrollSlop) scrolling = true;
+                                if (!scrolling) return;
+                                var minX = strip.originX - strip.leftMargin;
+                                var maxX = Math.max(minX, strip.originX + strip.contentWidth + strip.rightMargin - strip.width);
+                                strip.contentX = Math.max(minX, Math.min(maxX, pressContentX - dx));
+                                return;
+                            }
+                            var p = mapToItem(strip.contentItem, m.x, m.y);
+                            strip.dragTo = Math.max(0, Math.min(root.frameCount - 1, Math.floor((p.x + 3) / 58)));
+                        }
+                        onReleased: {
+                            if (strip.dragFrom >= 0) root.moveFrame(strip.dragFrom, strip.dragTo);
+                            strip.dragFrom = -1;
+                        }
+                        onCanceled: strip.dragFrom = -1
+                    }
                 }
             }
         }
@@ -997,6 +1129,25 @@ Rectangle {
                     else { armed = true; disarm.restart(); }
                 }
                 Timer { id: disarm; interval: 3000; onTriggered: delBtn.armed = false }
+            }
+            Btn {
+                id: holdBtn
+                property bool armed: false
+                readonly property bool held: root.historyRev >= 0 && root.layerCount > 0 && root.current < root.frameCount
+                                             && !root.layers[root.currentLayer].cels[root.current]
+                icon: "hold"
+                label: armed ? "Sure?" : "Hold"
+                flat: true
+                on: held || armed
+                enabledLook: root.current > 0
+                onTap: {
+                    if (root.current === 0) return;
+                    // making a hold drops this frame's own drawing, so ask first if it has ink
+                    if (!held && !armed && root.frame.strokes.length) { armed = true; disarmHold.restart(); return; }
+                    armed = false;
+                    root.toggleHold();
+                }
+                Timer { id: disarmHold; interval: 3000; onTriggered: holdBtn.armed = false }
             }
             Btn {
                 icon: "onion"
