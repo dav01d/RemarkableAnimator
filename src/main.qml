@@ -21,7 +21,8 @@ Rectangle {
     // MODEL
     // layers[l] = { name, visible, cels: [drawing | null] }: top layer first, one cel per frame;
     //             null holds the layer's drawing from an earlier frame
-    // drawing   = { key, canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item], dirty, edits }
+    // drawing   = { key, rev, canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item], dirty, edits }
+    //             (rev counts edits, so a thumbnail knows when to redraw)
     // edits     = [[at, deleteCount, [stroke]]] spliced into strokes since the last save, or null: unsaved as a whole
     // stroke    = { tool, color, pts: [{x, y, w}] }
     // op        = { t: "add", s } | { t: "swap", before: [stroke], after: [stroke] }
@@ -128,9 +129,17 @@ Rectangle {
     property bool showProjects: false
     property bool loading: false        // suppresses autosave while frames are rebuilt
 
-    onHistoryRevChanged: if (!loading && projectId) saveTimer.restart()
+    onHistoryRevChanged: {
+        if (!loading && projectId) saveTimer.restart();
+        thumbTimer.restart();
+    }
 
     Timer { id: saveTimer; interval: 2000; onTriggered: root.saveProject() }
+
+    // Timeline thumbnails redraw once the pen has rested, so drawing stays fast
+    property int thumbRev: 0
+    Timer { id: thumbTimer; interval: 1500; onTriggered: root.thumbRev++ }
+    readonly property int thumbStep: 4  // thumbnails draw every 4th point
 
     WorkerScript {
         id: storage
@@ -293,7 +302,7 @@ Rectangle {
     // FRAMES
     // ---------------------------------------------------------------
     function newDrawing(strokes) {
-        var d = { key: ++frameKeys, strokes: strokes, undo: [], redo: [], queue: [], full: true, trash: [], edits: null };
+        var d = { key: ++frameKeys, rev: 0, strokes: strokes, undo: [], redo: [], queue: [], full: true, trash: [], edits: null };
         d.canvas = canvasComp.createObject(stage);
         return d;
     }
@@ -520,6 +529,29 @@ Rectangle {
         if (next) for (var n = 0; n < next.strokes.length; n++) drawStroke(ctx, next.strokes[n], 0.5, nextInk);
     }
 
+    // A drawing in miniature (thin lines, every few points), centred in the canvas; pts is either
+    // [{x, y}] or flat [x, y, ...] (the project list's thumbnails)
+    function paintThumb(c, strokes) {
+        var ctx = c.getContext("2d");
+        if (!ctx) return;
+        ctx.reset();
+        var k = Math.min(c.width / stage.width, c.height / stage.height);
+        ctx.translate((c.width - stage.width * k) / 2, (c.height - stage.height * k) / 2);
+        ctx.scale(k, k);
+        ctx.lineWidth = 1.5 / k; ctx.lineCap = "round"; ctx.lineJoin = "round";
+        for (var i = 0; i < strokes.length; i++) {
+            var s = strokes[i], flat = !s.pts, pts = flat ? s : s.pts, n = flat ? pts.length / 2 : pts.length;
+            if (!n) continue;
+            var at = j => flat ? [pts[2 * j], pts[2 * j + 1]] : [pts[j].x, pts[j].y];
+            ctx.strokeStyle = flat ? "black" : s.color;
+            ctx.beginPath();
+            ctx.moveTo.apply(ctx, at(0));
+            for (var j = flat ? 1 : thumbStep; j < n; j += flat ? 1 : thumbStep) ctx.lineTo.apply(ctx, at(j));
+            ctx.lineTo.apply(ctx, at(n - 1));
+            ctx.stroke();
+        }
+    }
+
     // Blend a #rrggbb color toward white, keeping `strength` of its darkness
     function fade(hex, strength) {
         var out = "#";
@@ -613,6 +645,7 @@ Rectangle {
     function spliceStrokes(f, at, del, ins) {
         f.strokes.splice.apply(f.strokes, [at, del].concat(ins));
         if (f.edits) f.edits.push([at, del, ins]);
+        f.rev++;
     }
 
     function undo() {
@@ -1062,8 +1095,8 @@ Rectangle {
                 property int scrollSlop: 24 // px the pen may wander during a hold before it scrolls instead
                 interactive: false // the pen scrolls it below; a palm mustn't
 
-                // One column per frame, one cell per layer: a numbered box where a drawing starts,
-                // a line where the layer holds it
+                // One column per frame, one cell per layer: a thumbnail where a drawing starts (its
+                // number in the corner), a line where the layer holds it
                 delegate: Item {
                     id: column
                     property int frameIndex: index
@@ -1076,6 +1109,7 @@ Rectangle {
                             readonly property bool drawn: root.historyRev >= 0 && !!cels[column.frameIndex] // same array after edits: re-read on each
                             readonly property bool here: column.frameIndex === root.current
                             readonly property bool mine: here && index === root.currentLayer
+                            readonly property var drawing: root.historyRev >= 0 && drawn ? cels[column.frameIndex] : null
                             y: index * 58
                             width: 52; height: 52
                             Rectangle { // held: the drawing carries on
@@ -1085,19 +1119,35 @@ Rectangle {
                                 color: "black"
                             }
                             Rectangle {
-                                visible: parent.drawn || parent.here
+                                id: cellBox
+                                readonly property Item cell: parent
+                                visible: cell.drawn || cell.here
                                 anchors.fill: parent; radius: 6
-                                color: column.frameIndex === strip.dragFrom ? "#bbbbbb" : parent.mine && parent.drawn ? "black"
-                                     : parent.drawn ? "white" : "transparent"
+                                color: column.frameIndex === strip.dragFrom ? "#bbbbbb" : cell.drawn ? "white" : "transparent"
                                 border.color: "black"
-                                border.width: strip.dragFrom >= 0 && column.frameIndex === strip.dragTo ? 6 : parent.here ? 4 : 2
-                                Text {
-                                    anchors.centerIn: parent
-                                    visible: parent.parent.drawn
-                                    // the drawing's number within its layer
-                                    text: root.historyRev >= 0 && parent.parent.cels.slice(0, column.frameIndex + 1).filter(d => d).length
-                                    font.pixelSize: 20; font.bold: true
-                                    color: parent.parent.mine && column.frameIndex !== strip.dragFrom ? "white" : "black"
+                                border.width: strip.dragFrom >= 0 && column.frameIndex === strip.dragTo ? 6 : cell.here ? 4 : 2
+                                Canvas {
+                                    anchors.fill: parent; anchors.margins: 4
+                                    visible: cellBox.cell.drawn
+                                    renderTarget: Canvas.Image
+                                    // Redraws when its drawing changes: at once for another drawing, after the pen rests for edits
+                                    readonly property string stamp: root.thumbRev >= 0 && cellBox.cell.drawing
+                                                                    ? cellBox.cell.drawing.key + ":" + cellBox.cell.drawing.rev : ""
+                                    onStampChanged: requestPaint()
+                                    onPaint: root.paintThumb(this, cellBox.cell.drawing ? cellBox.cell.drawing.strokes : [])
+                                }
+                                Rectangle { // the drawing's number within its layer; black on the one under the pen
+                                    visible: cellBox.cell.drawn
+                                    width: Math.max(18, num.implicitWidth + 6); height: 18; radius: 4
+                                    color: cellBox.cell.mine ? "black" : "white"
+                                    border.color: "black"; border.width: 1
+                                    Text {
+                                        id: num
+                                        anchors.centerIn: parent
+                                        text: root.historyRev >= 0 && cellBox.cell.cels.slice(0, column.frameIndex + 1).filter(d => d).length
+                                        font.pixelSize: 13; font.bold: true
+                                        color: cellBox.cell.mine ? "white" : "black"
+                                    }
                                 }
                             }
                         }
@@ -1330,9 +1380,16 @@ Rectangle {
                 width: ListView.view.width
                 height: 96
                 color: modelData.id === root.projectId ? "#e6e6e6" : "white"
+                Canvas { // frame 1 in miniature, kept in the index by the storage worker
+                    x: 16; y: 8
+                    width: Math.round(height * stage.width / Math.max(1, stage.height)); height: parent.height - 16
+                    renderTarget: Canvas.Image
+                    onPaint: root.paintThumb(this, modelData.thumb || [])
+                    Rectangle { anchors.fill: parent; color: "transparent"; border.color: "#aaaaaa"; border.width: 1 }
+                }
                 Column {
                     anchors.verticalCenter: parent.verticalCenter
-                    x: 24
+                    x: 136
                     spacing: 4
                     Text { text: modelData.name; font.pixelSize: 26; font.bold: true }
                     Text {
