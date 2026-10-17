@@ -775,6 +775,7 @@ Rectangle {
             // Press and hold a frame, then drag it left/right to retime the animation
             property int dragFrom: -1
             property int dragTo: -1
+            property int scrollSlop: 24 // px the pen may wander during a hold before it scrolls instead
             interactive: dragFrom < 0
 
             delegate: Rectangle {
@@ -789,14 +790,32 @@ Rectangle {
                     font.pixelSize: 20; font.bold: true
                     color: index === root.current && index !== strip.dragFrom ? "white" : "black"
                 }
+                // The pen jitters past Qt's drag distance (~1 mm here) before a hold fires, which
+                // let the ListView steal the press. Keep the press and scroll the strip ourselves.
                 MouseArea {
                     anchors.fill: parent
                     pressAndHoldInterval: 350
-                    preventStealing: strip.dragFrom >= 0
-                    onClicked: root.goTo(index)
-                    onPressAndHold: { strip.dragFrom = index; strip.dragTo = index; }
+                    preventStealing: true
+                    property real pressX
+                    property real pressContentX
+                    property bool scrolling: false
+                    onPressed: (m) => {
+                        pressX = mapToItem(strip, m.x, 0).x;
+                        pressContentX = strip.contentX;
+                        scrolling = false;
+                    }
+                    onClicked: if (!scrolling) root.goTo(index)
+                    onPressAndHold: if (!scrolling) { strip.dragFrom = index; strip.dragTo = index; }
                     onPositionChanged: (m) => {
-                        if (strip.dragFrom < 0) return;
+                        if (strip.dragFrom < 0) {
+                            var dx = mapToItem(strip, m.x, 0).x - pressX;
+                            if (Math.abs(dx) > strip.scrollSlop) scrolling = true;
+                            if (!scrolling) return;
+                            var minX = strip.originX - strip.leftMargin;
+                            var maxX = Math.max(minX, strip.originX + strip.contentWidth + strip.rightMargin - strip.width);
+                            strip.contentX = Math.max(minX, Math.min(maxX, pressContentX - dx));
+                            return;
+                        }
                         var p = mapToItem(strip.contentItem, m.x, m.y);
                         strip.dragTo = Math.max(0, Math.min(root.frameCount - 1, Math.floor((p.x + 3) / 58)));
                     }
