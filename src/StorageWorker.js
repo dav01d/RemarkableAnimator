@@ -1,6 +1,7 @@
 // Runs in a WorkerScript thread: projects can hold tens of thousands of points, and
 // serializing them on the UI thread would stall xochitl.
-// Files: <dir>/index.json = [{ id, name, updated, frames }], <dir>/<id>.json = project:
+// Files: <dir>/index.json = [{ id, name, updated, frames, thumb }], <dir>/<id>.json = project:
+//   (thumb: frame 1's finished ink as [[x, y, x, y, ...]], a few hundred points at most)
 //   { id, name, fps, length, layers: [{ name, visible, cels: [{ at, strokes }] }] }
 //   (version 1 had frames: [strokes] in place of length and layers; it loads as one layer)
 // Strokes are stored compactly: { t: tool, c: color, p: [x, y, w, x, y, w, ...] }.
@@ -51,6 +52,22 @@ function unpack(strokes) {
 }
 
 function failed(message) { WorkerScript.sendMessage({ op: "error", message: message }); }
+
+var thumbPoints = 300; // about how many points a project list thumbnail keeps
+
+function thumbnail(layers) {
+    var strokes = [], total = 0;
+    for (var l = layers.length - 1; l >= 0; l--) // bottom layer first; every layer starts with a drawing
+        if (layers[l].visible && layers[l].cels.length)
+            layers[l].cels[0].strokes.forEach(function(s) { if (s.c === "#000000") { strokes.push(s.p); total += s.p.length / 3; } });
+    var step = Math.max(1, Math.ceil(total / thumbPoints));
+    return strokes.map(function(p) {
+        var out = [];
+        for (var i = 0; i < p.length; i += 3 * step) out.push(Math.round(p[i]), Math.round(p[i + 1]));
+        out.push(Math.round(p[p.length - 3]), Math.round(p[p.length - 2]));
+        return out;
+    });
+}
 
 WorkerScript.onMessage = function(msg) {
     if (msg.op === "list") {
@@ -113,7 +130,7 @@ WorkerScript.onMessage = function(msg) {
             if (ok === null) return failed("Couldn't save");
             readIndex(msg.dir, function(index) {
                 index = index.filter(function(e) { return e.id !== p.id; });
-                index.unshift({ id: p.id, name: p.name, updated: Date.now(), frames: length });
+                index.unshift({ id: p.id, name: p.name, updated: Date.now(), frames: length, thumb: thumbnail(layers) });
                 request("PUT", msg.dir + "/index.json", JSON.stringify(index), function() {
                     WorkerScript.sendMessage({ op: "saved", index: index });
                 });
