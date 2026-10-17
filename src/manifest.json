@@ -1,0 +1,9 @@
+{
+  "id": "remarkable-animator",
+  "name": "Animator",
+  "loadsBackend": true,
+  "entry": "/main.qml",
+  "canHaveMultipleFrontends": false,
+  "supportsScaling": true,
+  "supportsRotation": true
+}

@@ -1,0 +1,9 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+    <qresource>
+        <file>main.qml</file>
+        <file>ExportWorker.js</file>
+        <file>StorageWorker.js</file>
+        <file>QrCode.js</file>
+    </qresource>
+</RCC>

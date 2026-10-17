@@ -1,0 +1,81 @@
+# RemarkableAnimator One-Click Deployment Script
+param (
+    [string]$TargetIp = "10.11.99.1",   # USB address of every reMarkable; put your Wi-Fi IP in deploy.local.ps1
+    [string]$FallbackIp = "10.11.99.1",
+    [switch]$Restart  # also restart xochitl (normally unneeded: AppLoad reloads the app on launch)
+)
+
+$ErrorActionPreference = "Stop"
+
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$srcDir = Join-Path $scriptDir "src"
+
+Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host "  RemarkableAnimator Deployment to Tablet  " -ForegroundColor Cyan
+Write-Host "==========================================" -ForegroundColor Cyan
+
+# Optional machine-specific settings in deploy.local.ps1 (git-ignored), e.g.:
+#   $TargetIp = "192.168.1.50"              # the tablet's Wi-Fi address
+#   $askpass  = "C:\path\to\askpass.cmd"    # prints the root password, for non-interactive ssh
+# Without an askpass, ssh simply prompts for the password.
+$askpass = $null
+$localConfig = Join-Path $scriptDir "deploy.local.ps1"
+if (Test-Path $localConfig) { . $localConfig }
+if ($askpass -and (Test-Path $askpass)) {
+    $env:SSH_ASKPASS = $askpass
+    $env:SSH_ASKPASS_REQUIRE = "force"
+    $env:DISPLAY = "dummy"
+}
+
+# Test connectivity
+$ip = $TargetIp
+Write-Host "Checking connection to $ip:22..." -NoNewline
+$tcp = New-Object System.Net.Sockets.TcpClient
+$async = $tcp.BeginConnect($ip, 22, $null, $null)
+$success = $async.AsyncWaitHandle.WaitOne(2000)
+
+if (-not $success) {
+    Write-Host " TIMEOUT" -ForegroundColor Yellow
+    Write-Host "Trying fallback USB IP $FallbackIp:22..." -NoNewline
+    $ip = $FallbackIp
+    $tcp = New-Object System.Net.Sockets.TcpClient
+    $async = $tcp.BeginConnect($ip, 22, $null, $null)
+    $success = $async.AsyncWaitHandle.WaitOne(2000)
+    if (-not $success) {
+        Write-Host " FAILED" -ForegroundColor Red
+        Write-Error "Could not connect to tablet at $TargetIp or $FallbackIp. Ensure Wi-Fi or USB cable is connected."
+    }
+}
+Write-Host " CONNECTED ($ip)" -ForegroundColor Green
+$tcp.Close()
+
+# Target app directory on device
+$remoteAppDir = "/home/root/xovi/exthome/appload/RemarkableAnimator"
+
+Write-Host "Ensuring remote directory exists..."
+ssh -o StrictHostKeyChecking=no root@$ip "mkdir -p $remoteAppDir /home/root/.local/share/remarkable-animator"  # app + saved animations
+
+# A running backend can't be overwritten ("text file busy"); stop ours first
+ssh -o StrictHostKeyChecking=no root@$ip 'for p in $(pidof entry); do readlink /proc/$p/exe | grep -q RemarkableAnimator && kill $p; done; true'
+
+Write-Host "Copying files to $remoteAppDir..."
+scp -o StrictHostKeyChecking=no -r "$srcDir/*" "root@${ip}:${remoteAppDir}/"
+
+Write-Host "Setting executable permissions..."
+ssh -o StrictHostKeyChecking=no root@$ip "chmod +x $remoteAppDir/backend/entry 2>/dev/null || true"
+
+# AppLoad loads the app fresh on every launch, so copying is enough. -Restart reloads xochitl
+# (e.g. a new app's first install); if a reboot wiped XOVI's tmpfs hook, xovi/start reinstalls
+# it. Restarting xochitl while the app is open can crash it, hence opt-in.
+if (-not $Restart) {
+    Write-Host "Copied. Exit and reopen the app on the tablet to load it." -ForegroundColor Green
+    exit 0
+}
+Write-Host "Reloading the tablet UI..."
+ssh -o StrictHostKeyChecking=no root@$ip "if [ -f /etc/systemd/system/xochitl.service.d/00-xovi.conf ]; then systemctl restart xochitl; else bash /home/root/xovi/start; fi"
+
+Write-Host "==========================================" -ForegroundColor Green
+Write-Host "  Deployment Complete!                     " -ForegroundColor Green
+Write-Host "  App is located at:                       " -ForegroundColor Green
+Write-Host "  $remoteAppDir                            " -ForegroundColor Green
+Write-Host "==========================================" -ForegroundColor Green
