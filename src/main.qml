@@ -80,10 +80,11 @@ Rectangle {
     // Export
     property string statusMessage: ""
     property string exportedUrl: ""
-    property string exportFormat: ""    // "gif" | "svg" | "zip"; empty while choosing
+    property string exportFormat: ""    // "gif" | "svg" | "zip" | "pdf"; empty while choosing
     readonly property var exportFormats: ({ gif: { label: "GIF", file: "flipbook.gif", type: "image/gif" },
                                             svg: { label: "Animated SVG", file: "flipbook.svg", type: "image/svg+xml" },
-                                            zip: { label: "SVG frames", file: "flipbook-svg.zip", type: "application/zip" } })
+                                            zip: { label: "SVG frames", file: "flipbook-svg.zip", type: "application/zip" },
+                                            pdf: { label: "PDF flipbook", file: "flipbook.pdf", type: "application/pdf" } })
     property bool showExportModal: false
     property bool isExporting: false
 
@@ -1495,7 +1496,7 @@ Rectangle {
                     spacing: 12
                     visible: !root.exportFormat
                     Repeater {
-                        model: ["gif", "svg", "zip"]
+                        model: ["gif", "svg", "zip", "pdf"]
                         Btn { label: root.exportFormats[modelData].label; on: index === 0; onTap: root.startExport(modelData) }
                     }
                 }
@@ -1518,7 +1519,7 @@ Rectangle {
         isPlaying = false;
         exportFormat = "";
         exportedUrl = "";
-        statusMessage = "GIF plays anywhere; SVG keeps the lines sharp at any size (planning ink is left out)";
+        statusMessage = "GIF plays anywhere; SVG and PDF keep the lines sharp (PDF: a page per frame). Planning ink is left out.";
         showExportModal = true;
     }
 
