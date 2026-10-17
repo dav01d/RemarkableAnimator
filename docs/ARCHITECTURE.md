@@ -21,7 +21,7 @@ running inside xochitl (the reMarkable UI), plus a tiny native backend for pen p
 | The e-ink waveform is chosen per region (`DisplayMethodArea`). `UFast` puts new ink on the panel noticeably sooner than `Fast`, but it's 1-bit. | The canvas uses `UFast` while the pen is down and `Fast` otherwise, so grey ink settles on pen-up. |
 | xochitl has a **one-minute watchdog**: block its UI thread that long and it is killed. | Export and saving run in `WorkerScript` threads; the live stroke stays a handful of items however long it gets; erasing redraws only the eraser's area. |
 | A JS object assigned to a QML property is **copied**. | Canvases look their frame up instead of holding a reference. |
-| Handing data to a `WorkerScript` deep-copies it **on the UI thread** (~1 s for a 650 KB project). | Autosave sends only frames edited since the last save; the storage worker keeps the rest. |
+| Handing data to a `WorkerScript` deep-copies it **on the UI thread** (~1 s for a 650 KB project). | Autosave sends only the strokes added or changed since the last save (or the whole frame when that is less); the storage worker keeps the rest, including the frames it just loaded. |
 | AppLoad logs a line for every backend message. | The backend sends only real pressure changes (≥1.5%, at most every 15 ms) and nothing while hovering. |
 | AppLoad caches an app's `resources.rcc` until xochitl restarts; a reboot drops XOVI (its hook lives on tmpfs). | Deploying is copy, close the app, restart xochitl (`deploy.ps1 -Restart`). If AppLoad disappears after a reboot, run `/home/root/xovi/start`. |
 | AppLoad's virtual keyboard only serves framebuffer apps. | Rename has its own on-screen keyboard. |

@@ -19,7 +19,8 @@ Rectangle {
 
     // ---------------------------------------------------------------
     // MODEL
-    // frames[i] = { key, canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item], dirty, unsaved }
+    // frames[i] = { key, canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item], dirty, edits }
+    // edits     = [[at, deleteCount, [stroke]]] spliced into strokes since the last save, or null: unsaved as a whole
     // stroke    = { tool, color, pts: [{x, y, w}] }
     // op        = { t: "add", s } | { t: "swap", before: [stroke], after: [stroke] }
     // ---------------------------------------------------------------
@@ -124,6 +125,7 @@ Rectangle {
                 root.projectIndex = m.index;
             } else {
                 console.log("[Animator] storage:", m.message);
+                for (var i = 0; i < root.frames.length; i++) root.frames[i].edits = null; // resend everything next save
                 if (!root.projectId) root.newProject(); // unreadable save: don't leave the user without a project
             }
         }
@@ -132,17 +134,24 @@ Rectangle {
     function saveProject() {
         if (!projectId) return;
         saveTimer.stop();
-        // Handing strokes to the worker copies them on this thread, so send only edited frames
-        var t0 = Date.now(), order = [], changed = {}, n = 0;
+        // Handing strokes to the worker copies them on this thread, so send only what changed since
+        // the last save: each frame's edits, or the whole frame when that's fewer points to copy
+        var t0 = Date.now(), order = [], whole = {}, edits = {}, n = 0, pts = 0;
         for (var i = 0; i < frames.length; i++) {
             var f = frames[i];
             order.push(f.key);
-            if (f.unsaved) { changed[f.key] = f.strokes; f.unsaved = false; n++; }
+            if (f.edits && !f.edits.length) continue;
+            var all = pointCount(f.strokes), changed = f.edits ? f.edits.reduce((c, e) => c + pointCount(e[2]), 0) : Infinity;
+            if (changed < all) { edits[f.key] = f.edits; pts += changed; } else { whole[f.key] = f.strokes; pts += all; }
+            f.edits = [];
+            n++;
         }
         storage.sendMessage({ op: "save", dir: storageDir,
-                              project: { id: projectId, name: projectName, fps: fps, order: order, changed: changed } });
-        console.log("[Animator][perf] save handoff", n, "of", order.length, "frames,", Date.now() - t0, "ms");
+                              project: { id: projectId, name: projectName, fps: fps, order: order, whole: whole, edits: edits } });
+        console.log("[Animator][perf] save handoff", n, "of", order.length, "frames,", pts, "pts,", Date.now() - t0, "ms");
     }
+
+    function pointCount(strokes) { return strokes.reduce((c, s) => c + s.pts.length, 0); }
 
     function newProject() {
         saveProject();
@@ -193,6 +202,7 @@ Rectangle {
         var fi = fpsOptions.indexOf(p.fps);
         if (fi >= 0) fpsIndex = fi;
         resetFrames(p.frames.length ? p.frames : [[]]);
+        if (p.frames.length) for (var i = 0; i < frames.length; i++) frames[i].edits = []; // the storage worker kept them
         saveProject(); // marks it most recent, so it reopens next launch
     }
 
@@ -203,6 +213,7 @@ Rectangle {
         for (var i = 0; i < frames.length; i++) frames[i].canvas.destroy();
         frames = [];
         frameCount = 0;
+        frameKeys = 0; // keys 1..n, as the storage worker keys a project it loads
         current = 0;
         for (var j = 0; j < data.length; j++) insertFrame(j, { strokes: data[j] });
         current = 0;
@@ -238,7 +249,7 @@ Rectangle {
     // FRAMES
     // ---------------------------------------------------------------
     function insertFrame(at, copyFrom) {
-        var f = { key: ++frameKeys, strokes: copyFrom ? copyFrom.strokes.slice() : [], undo: [], redo: [], queue: [], full: true, trash: [], unsaved: true };
+        var f = { key: ++frameKeys, strokes: copyFrom ? copyFrom.strokes.slice() : [], undo: [], redo: [], queue: [], full: true, trash: [], edits: null };
         f.canvas = canvasComp.createObject(stage);
         frames.splice(at, 0, f);
         frameCount = frames.length;
@@ -464,17 +475,21 @@ Rectangle {
     function pushOp(op) {
         frame.undo.push(op);
         frame.redo = [];
-        frame.unsaved = true;
         historyRev++;
+    }
+
+    // Every change to a frame's strokes goes through here, so autosave can send just the change
+    function spliceStrokes(f, at, del, ins) {
+        f.strokes.splice.apply(f.strokes, [at, del].concat(ins));
+        if (f.edits) f.edits.push([at, del, ins]);
     }
 
     function undo() {
         var f = frame, op = f && f.undo.pop();
         if (!op) return;
-        if (op.t === "add") f.strokes.splice(f.strokes.indexOf(op.s), 1);
-        else f.strokes = op.before.slice();
+        if (op.t === "add") spliceStrokes(f, f.strokes.indexOf(op.s), 1, []);
+        else spliceStrokes(f, 0, f.strokes.length, op.before);
         f.redo.push(op);
-        f.unsaved = true;
         repaint(f);
         historyRev++;
     }
@@ -482,10 +497,9 @@ Rectangle {
     function redo() {
         var f = frame, op = f && f.redo.pop();
         if (!op) return;
-        if (op.t === "add") f.strokes.push(op.s);
-        else f.strokes = op.after.slice();
+        if (op.t === "add") spliceStrokes(f, f.strokes.length, 0, [op.s]);
+        else spliceStrokes(f, 0, f.strokes.length, op.after);
         f.undo.push(op);
-        f.unsaved = true;
         repaint(f);
         historyRev++;
     }
@@ -494,7 +508,7 @@ Rectangle {
         var f = frame;
         if (!f.strokes.length) return;
         pushOp({ t: "swap", before: f.strokes.slice(), after: [] });
-        f.strokes = [];
+        spliceStrokes(f, 0, f.strokes.length, []);
         repaint(f);
     }
 
@@ -533,7 +547,7 @@ Rectangle {
             var repl = [];
             for (var k = 0; k < pieces.length; k++)
                 if (pieces[k].length > 1 || s.pts.length === 1) repl.push({ tool: s.tool, color: s.color, pts: pieces[k] });
-            strokes.splice.apply(strokes, [i, 1].concat(repl));
+            spliceStrokes(frame, i, 1, repl);
             hitAny = true;
         }
         if (hitAny) {
@@ -591,7 +605,7 @@ Rectangle {
         if (liveErasing && eraseOp.hit) pushOp({ t: "swap", before: eraseOp.before, after: frame.strokes.slice() });
         if (live) {
             var f = frame, s = { tool: live.tool, color: live.color, pts: live.pts };
-            f.strokes.push(s);
+            spliceStrokes(f, f.strokes.length, 0, [s]);
             for (var k in live.tiles) f.trash.push(live.tiles[k].canvas);
             queueStroke(f, s);
             pushOp({ t: "add", s: s });
