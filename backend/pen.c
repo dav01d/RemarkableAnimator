@@ -7,6 +7,8 @@
 // Protocol (AppLoad): SOCK_SEQPACKET unix socket at argv[1]; each message is a
 // { u32 type; u32 length } header packet followed by a payload packet.
 // We send type 1 = "pressure tiltX tiltY eraser touching" (pressure 0..1000, tilt -1000..1000).
+// Type 2 = Wi-Fi share: the frontend sends "<content-type> <path>" and we reply with the link
+// (http://...) or the reason it failed. See share.c.
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -21,7 +23,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "share.h"
+
 #define MSG_PEN 1
+#define MSG_SHARE 2
 #define MSG_TERMINATE 0xFFFFFFFFu
 #define MIN_INTERVAL_MS 15
 #define MIN_PRESSURE_STEP 15 // of 1000: AppLoad logs every message, so send only real changes
@@ -87,17 +92,28 @@ int main(int argc, char **argv) {
     int pressure = 0, tx = 0, ty = 0, eraser = 0, touching = 0;
     int sent_eraser = -1, sent_touching = -1, sent_pressure = -1000, dirty = 0;
     long last_sent = 0;
-    struct pollfd fds[2] = { { sock, POLLIN, 0 }, { pen, POLLIN, 0 } }; // fd -1 is ignored by poll
+    struct pollfd fds[2 + SHARE_FDS] = { { sock, POLLIN, 0 }, { pen, POLLIN, 0 } }; // fd -1 is ignored by poll
 
     for (;;) {
-        if (poll(fds, 2, -1) < 0) break;
+        int nshare = share_fds(fds + 2); // the Wi-Fi share's sockets, while it runs
+        if (poll(fds, 2 + nshare, share_timeout(now_ms())) < 0) break;
+        share_run(fds + 2, nshare, now_ms());
 
-        if (fds[0].revents) { // frontend closed or told us to terminate
+        if (fds[0].revents) { // a message from the frontend, or it closed
             uint32_t header[2];
-            char buf[256];
+            char buf[512] = "", reply[256];
+            ssize_t n = 0;
             if (recv(sock, header, sizeof header, 0) <= 0) break;
-            if (header[1] && recv(sock, buf, sizeof buf, 0) <= 0) break;
+            if (header[1] && (n = recv(sock, buf, sizeof buf - 1, 0)) <= 0) break;
             if (header[0] == MSG_TERMINATE) break;
+            buf[n] = 0;
+            char *path = strchr(buf, ' ');
+            if (header[0] == MSG_SHARE && path) {
+                *path++ = 0;
+                share_start(path, buf, now_ms(), reply, sizeof reply);
+                fprintf(stderr, "[pen] share: %s\n", reply);
+                if (send_msg(sock, MSG_SHARE, reply) < 0) return 0;
+            }
         }
 
         if (fds[1].revents & POLLIN) {

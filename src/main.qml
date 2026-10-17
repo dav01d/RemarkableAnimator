@@ -6,8 +6,8 @@ import "QrCode.js" as QrCodeLib
 
 // Rendering note: xochitl's e-paper scene graph (libqsgepaper) only draws rectangles,
 // images, text and painted items; QtQuick.Shapes renders nothing there. So the live
-// stroke is drawn as small rotated Rectangles (tiny e-ink updates, low latency) and on
-// pen-up it is baked into the frame's Canvas image and the Rectangles are destroyed.
+// stroke is drawn into small Canvas tiles under the pen (tiny e-ink updates) and on
+// pen-up it is baked into the frame's Canvas image and the tiles are destroyed.
 Rectangle {
     id: root
     anchors.fill: parent
@@ -19,24 +19,37 @@ Rectangle {
 
     // ---------------------------------------------------------------
     // MODEL
-    // frames[i] = { canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item] }
+    // layers[l] = { name, visible, cels: [drawing | null] }: top layer first, one cel per frame;
+    //             null holds the layer's drawing from an earlier frame
+    // drawing   = { key, rev, canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item], dirty, edits }
+    //             (rev counts edits, so a thumbnail knows when to redraw)
+    // edits     = [[at, deleteCount, [stroke]]] spliced into strokes since the last save, or null: unsaved as a whole
     // stroke    = { tool, color, pts: [{x, y, w}] }
     // op        = { t: "add", s } | { t: "swap", before: [stroke], after: [stroke] }
     // ---------------------------------------------------------------
-    property var frames: []
+    property var layers: []
+    property int layerCount: 0
+    property int currentLayer: 0
+    readonly property int maxLayers: 3
     property int frameCount: 0
     property int current: 0
     property int historyRev: 0 // bumped on every edit so Undo/Redo enablement re-evaluates
+    property int frameKeys: 0  // last drawing key handed out; the storage worker caches saved drawings by key
 
     // Tools
-    // One pressure-sensitive pen in three sizes, black or grey. Flip the Marker to erase.
+    // One pressure-sensitive pen in three sizes: black to finish, light grey to plan.
+    // Flip the Marker, or pick the eraser, to erase.
     property string inkColor: "#000000"
+    readonly property string planInk: "#c0c0c0"
+    property bool eraserTool: false
+    property bool showPlanning: true    // planning ink on screen; export always leaves it out
     property var sizes: [2, 5, 10]
     property int sizeIndex: 1
 
     // Playback
     property bool isPlaying: false
     property int onionDepth: 2          // how many previous frames show through (0 = off)
+    readonly property string nextInk: "#2060c0" // the next drawing's onion skin (blue on colour panels)
     property var fpsOptions: [6, 8, 12, 24]
     property int fpsIndex: 2
     readonly property int fps: fpsOptions[fpsIndex]
@@ -50,6 +63,7 @@ Rectangle {
         id: penBackend
         applicationID: "remarkable-animator"
         onMessageReceived: (type, contents) => {
+            if (type === 2) return root.wifiShared(contents); // the Wi-Fi share's link, or why it failed
             if (type !== 1) return;
             var v = contents.split(" "); // "pressure tiltX tiltY eraser touching"
             root.penPressure = v[0] / 1000;
@@ -58,27 +72,53 @@ Rectangle {
     }
 
     // Live gesture
-    property var live: null             // stroke being drawn, plus items: [Rectangle]
+    property var live: null             // stroke being drawn, plus tiles: { "col,row": { canvas, segs } }
+    property int liveTile: 128          // px: size of the Canvas tiles the live stroke is drawn into
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
+    property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
 
     // Export
     property string statusMessage: ""
     property string exportedUrl: ""
+    property string exportFormat: ""    // "gif" | "svg" | "zip" | "pdf"; empty while choosing
+    readonly property var exportFormats: ({ gif: { label: "GIF", file: "flipbook.gif", type: "image/gif" },
+                                            svg: { label: "Animated SVG", file: "flipbook.svg", type: "image/svg+xml" },
+                                            zip: { label: "SVG frames", file: "flipbook-svg.zip", type: "application/zip" },
+                                            pdf: { label: "PDF flipbook", file: "flipbook.pdf", type: "application/pdf" } })
+    property bool shareWifi: false      // serve the export from the tablet on Wi-Fi instead of uploading it
     property bool showExportModal: false
     property bool isExporting: false
 
-    readonly property var frame: current < frameCount ? frames[current] : null
+    // The drawing under the pen: the current layer's at the current frame (its own or a held one)
+    readonly property var frame: historyRev >= 0 && current < frameCount ? drawingAt(currentLayer, current) : null
     readonly property bool canUndo: historyRev >= 0 && !!frame && frame.undo.length > 0
     readonly property bool canRedo: historyRev >= 0 && !!frame && frame.redo.length > 0
 
     onCurrentChanged: refreshLayers()
+    onCurrentLayerChanged: refreshLayers()
+    onShowPlanningChanged: {
+        drawings().forEach(d => d.full = true);
+        refreshLayers();
+    }
+
+    // Latency probe: pen move -> next frame the window has drawn (app side only; the e-ink
+    // panel adds its own refresh on top)
+    Connections {
+        target: root.Window.window
+        function onFrameSwapped() {
+            if (!root.moveWaiting || !root.live) return;
+            var ms = Date.now() - root.moveWaiting, l = root.live;
+            root.moveWaiting = 0;
+            l.lat = (l.lat || 0) + ms; l.frames = (l.frames || 0) + 1; l.latMax = Math.max(l.latMax || 0, ms);
+        }
+    }
     onIsPlayingChanged: refreshLayers()
     onOnionDepthChanged: refreshLayers()
 
     Component.onCompleted: {
         loadSettings();
-        insertFrame(0, null);
+        resetLayers(blankLayers());
         storage.sendMessage({ op: "list", dir: storageDir }); // then reopen the latest animation
     }
 
@@ -92,9 +132,17 @@ Rectangle {
     property bool showProjects: false
     property bool loading: false        // suppresses autosave while frames are rebuilt
 
-    onHistoryRevChanged: if (!loading && projectId) saveTimer.restart()
+    onHistoryRevChanged: {
+        if (!loading && projectId) saveTimer.restart();
+        thumbTimer.restart();
+    }
 
     Timer { id: saveTimer; interval: 2000; onTriggered: root.saveProject() }
+
+    // Timeline thumbnails redraw once the pen has rested, so drawing stays fast
+    property int thumbRev: 0
+    Timer { id: thumbTimer; interval: 1500; onTriggered: root.thumbRev++ }
+    readonly property int thumbStep: 4  // thumbnails draw every 4th point
 
     WorkerScript {
         id: storage
@@ -109,6 +157,7 @@ Rectangle {
                 root.projectIndex = m.index;
             } else {
                 console.log("[Animator] storage:", m.message);
+                root.drawings().forEach(d => d.edits = null); // resend everything next save
                 if (!root.projectId) root.newProject(); // unreadable save: don't leave the user without a project
             }
         }
@@ -117,18 +166,32 @@ Rectangle {
     function saveProject() {
         if (!projectId) return;
         saveTimer.stop();
-        var t0 = Date.now(), data = [];
-        for (var i = 0; i < frames.length; i++) data.push(frames[i].strokes);
+        // Handing strokes to the worker copies them on this thread, so send only what changed since
+        // the last save: each drawing's edits, or the whole drawing when that's fewer points to copy
+        var t0 = Date.now(), all = drawings(), whole = {}, edits = {}, n = 0, pts = 0;
+        for (var i = 0; i < all.length; i++) {
+            var f = all[i];
+            if (f.edits && !f.edits.length) continue;
+            var size = pointCount(f.strokes), changed = f.edits ? f.edits.reduce((c, e) => c + pointCount(e[2]), 0) : Infinity;
+            if (changed < size) { edits[f.key] = f.edits; pts += changed; } else { whole[f.key] = f.strokes; pts += size; }
+            f.edits = [];
+            n++;
+        }
+        var shape = layers.map(l => ({ name: l.name, visible: l.visible, cels: l.cels.map(d => d ? d.key : 0) }));
         storage.sendMessage({ op: "save", dir: storageDir,
-                              project: { id: projectId, name: projectName, fps: fps, frames: data } });
-        console.log("[Animator][perf] save handoff", Date.now() - t0, "ms");
+                              project: { id: projectId, name: projectName, fps: fps, layers: shape, whole: whole, edits: edits } });
+        console.log("[Animator][perf] save handoff", n, "of", all.length, "drawings,", pts, "pts,", Date.now() - t0, "ms");
     }
+
+    function pointCount(strokes) { return strokes.reduce((c, s) => c + s.pts.length, 0); }
 
     function newProject() {
         saveProject();
         projectId = "anim-" + Date.now();
-        projectName = "Animation " + (projectIndex.length + 1);
-        resetFrames([[]]);
+        var n = projectIndex.length + 1; // the next number no animation has (some may be deleted)
+        while (projectIndex.some(e => e.name === "Animation " + n)) n++;
+        projectName = "Animation " + n;
+        resetLayers(blankLayers());
         showProjects = false;
         saveProject();
     }
@@ -145,19 +208,36 @@ Rectangle {
 
     property bool showRename: false
     property string renameText: ""
+    property int renameLayer: -1        // the layer being renamed, or -1 for the animation
+    readonly property int renameMax: renameLayer < 0 ? 32 : 10 // a layer name fits its header
+    property bool kbShift: false        // the next letter is upper case (on again after a space)
+    property bool kbNumbers: false      // the keyboard shows digits and symbols
 
-    function startRename() { renameText = projectName; showRename = true; }
+    function startRename(l) {
+        renameLayer = l === undefined ? -1 : l;
+        renameText = renameLayer < 0 ? projectName : layers[l].name;
+        kbShift = false;
+        kbNumbers = false;
+        showRename = true;
+    }
 
     function typeKey(k) {
-        if (renameText.length >= 32) return;
-        var capital = renameText.length === 0 || renameText[renameText.length - 1] === " ";
-        renameText += capital ? k.toUpperCase() : k;
+        if (renameText.length >= renameMax) return;
+        renameText += kbShift ? k.toUpperCase() : k;
+        kbShift = k === " ";
     }
 
     function finishRename() {
         var name = renameText.trim();
-        if (name) { projectName = name; saveProject(); }
+        if (name && renameLayer < 0) { projectName = name; saveProject(); }
+        else if (name) { layers[renameLayer].name = name; historyRev++; } // autosave
         showRename = false;
+    }
+
+    // The list reply then opens the most recent one left (or a new one)
+    function deleteProject(id) {
+        if (id === projectId) { saveTimer.stop(); projectId = ""; }
+        storage.sendMessage({ op: "delete", dir: storageDir, id: id });
     }
 
     function openProject(id) {
@@ -172,25 +252,32 @@ Rectangle {
         projectName = p.name;
         var fi = fpsOptions.indexOf(p.fps);
         if (fi >= 0) fpsIndex = fi;
-        resetFrames(p.frames.length ? p.frames : [[]]);
+        resetLayers(p.length ? p.layers : blankLayers());
+        if (p.length) drawings().forEach(d => d.edits = []); // the storage worker kept them
         saveProject(); // marks it most recent, so it reopens next launch
     }
 
-    // Replace every frame with the given stroke lists
-    function resetFrames(data) {
+    function blankLayers() { return [{ name: "Layer 1", visible: true, cels: [[]] }]; }
+
+    // Replace every layer with the given ones: [{ name, visible, cels: [strokes | null] }]
+    function resetLayers(data) {
         loading = true;
         isPlaying = false;
-        for (var i = 0; i < frames.length; i++) frames[i].canvas.destroy();
-        frames = [];
-        frameCount = 0;
-        current = 0;
-        for (var j = 0; j < data.length; j++) insertFrame(j, { strokes: data[j] });
+        drawings().forEach(d => d.canvas.destroy());
+        layers = [];
+        frameKeys = 0; // keys 1..n, layer by layer, as the storage worker keys a project it loads
+        for (var l = 0; l < data.length; l++)
+            layers.push({ name: data[l].name, visible: data[l].visible, cels: data[l].cels.map(s => s ? newDrawing(s) : null) });
+        layerCount = layers.length;
+        currentLayer = 0;
+        frameCount = data[0].cels.length;
         current = 0;
         refreshLayers();
+        historyRev++;
         loading = false;
     }
 
-    // One frame's baked ink
+    // One drawing's baked ink
     Component {
         id: canvasComp
         Canvas {
@@ -203,20 +290,52 @@ Rectangle {
         }
     }
 
-    // One live stroke segment: a rounded bar from point a to point b
+    // One tile of the live stroke
     Component {
-        id: segComp
-        Rectangle { antialiasing: true }
+        id: tileComp
+        Canvas {
+            width: root.liveTile; height: root.liveTile
+            renderTarget: Canvas.Image
+            renderStrategy: Canvas.Immediate
+            onPaint: root.paintTile(this)
+        }
     }
 
     // ---------------------------------------------------------------
     // FRAMES
     // ---------------------------------------------------------------
+    function newDrawing(strokes) {
+        var d = { key: ++frameKeys, rev: 0, strokes: strokes, undo: [], redo: [], queue: [], full: true, trash: [], edits: null };
+        d.canvas = canvasComp.createObject(stage);
+        return d;
+    }
+
+    // A layer always starts with a drawing: if its first frame became a hold, its first drawing moves there
+    function keepFirstDrawing(l) {
+        var cels = layers[l].cels, i = cels.findIndex(d => d);
+        if (i > 0) { cels[0] = cels[i]; cels[i] = null; }
+    }
+
+    // The drawing layer l shows at frame i: its own, or the one it holds from an earlier frame
+    function drawingAt(l, i) {
+        var cels = layers[l].cels;
+        while (i >= 0 && !cels[i]) i--;
+        return i >= 0 ? cels[i] : null;
+    }
+
+    function drawings() {
+        var all = [];
+        for (var l = 0; l < layers.length; l++) all = all.concat(layers[l].cels.filter(d => d));
+        return all;
+    }
+
+    // A new frame: a drawing on the current layer (blank or a copy); the other layers hold
     function insertFrame(at, copyFrom) {
-        var f = { strokes: copyFrom ? copyFrom.strokes.slice() : [], undo: [], redo: [], queue: [], full: true, trash: [] };
-        f.canvas = canvasComp.createObject(stage);
-        frames.splice(at, 0, f);
-        frameCount = frames.length;
+        for (var l = 0; l < layers.length; l++) {
+            layers[l].cels.splice(at, 0, l === currentLayer ? newDrawing(copyFrom ? copyFrom.strokes.slice() : []) : null);
+            keepFirstDrawing(l);
+        }
+        frameCount = layers[0].cels.length;
         current = at;
         refreshLayers();
         historyRev++;
@@ -224,9 +343,14 @@ Rectangle {
 
     function deleteFrame() {
         if (frameCount <= 1) { clearFrame(); return; }
-        frames[current].canvas.destroy();
-        frames.splice(current, 1);
-        frameCount = frames.length;
+        for (var l = 0; l < layers.length; l++) {
+            var cels = layers[l].cels, d = cels.splice(current, 1)[0];
+            if (!d) continue;
+            if (current < cels.length && !cels[current]) cels[current] = d; // still held in the next frame
+            else d.canvas.destroy();
+            keepFirstDrawing(l);
+        }
+        frameCount = layers[0].cels.length;
         current = Math.min(current, frameCount - 1);
         refreshLayers();
         historyRev++;
@@ -234,21 +358,68 @@ Rectangle {
 
     function moveFrame(from, to) {
         if (from === to) return;
-        frames.splice(to, 0, frames.splice(from, 1)[0]);
+        for (var l = 0; l < layers.length; l++) {
+            layers[l].cels.splice(to, 0, layers[l].cels.splice(from, 1)[0]);
+            keepFirstDrawing(l);
+        }
         current = to;
         refreshLayers();
         historyRev++; // autosave
+    }
+
+    // Hold: the current layer keeps showing its earlier drawing here. Draw: a drawing of its own,
+    // starting as a copy of the held one.
+    function toggleHold() {
+        var cels = layers[currentLayer].cels, d = cels[current];
+        if (current === 0) return; // a layer always starts with a drawing
+        if (d) { d.canvas.destroy(); cels[current] = null; }
+        else cels[current] = newDrawing(frame.strokes.slice());
+        refreshLayers();
+        historyRev++;
+    }
+
+    // A new layer goes on top, with one blank drawing held through the whole animation
+    function addLayer() {
+        if (layers.length >= maxLayers) return;
+        var cels = [newDrawing([])];
+        for (var i = 1; i < frameCount; i++) cels.push(null);
+        layers.unshift({ name: "Layer " + (layers.length + 1), visible: true, cels: cels });
+        layerCount = layers.length;
+        currentLayer = 0;
+        refreshLayers();
+        historyRev++;
+    }
+
+    function deleteLayer(l) {
+        if (layers.length <= 1) return;
+        layers.splice(l, 1)[0].cels.forEach(d => d && d.canvas.destroy());
+        layerCount = layers.length;
+        currentLayer = Math.min(currentLayer, layerCount - 1);
+        refreshLayers();
+        historyRev++;
+    }
+
+    function toggleLayer(l) {
+        layers[l].visible = !layers[l].visible;
+        refreshLayers();
+        historyRev++;
     }
 
     function goTo(i) {
         if (i >= 0 && i < frameCount) current = i;
     }
 
+    // Show each visible layer's drawing for the current frame
     function refreshLayers() {
-        for (var i = 0; i < frames.length; i++) {
-            var c = frames[i].canvas;
-            c.visible = i === current;
-            if (c.visible && (frames[i].full || frames[i].queue.length)) c.requestPaint();
+        for (var l = 0; l < layers.length; l++) {
+            var shown = layers[l].visible ? drawingAt(l, current) : null, cels = layers[l].cels;
+            for (var i = 0; i < cels.length; i++) {
+                var d = cels[i];
+                if (!d) continue;
+                d.canvas.z = -0.1 * l; // upper layers on top, all above the onion skin
+                d.canvas.visible = d === shown;
+                if (d.canvas.visible && (d.full || d.queue.length)) d.canvas.requestPaint();
+            }
         }
         onionCanvas.requestPaint();
     }
@@ -301,8 +472,7 @@ Rectangle {
     // Looked up rather than stored on the Canvas: a JS object assigned to a QML
     // property is copied, so the Canvas would see a stale snapshot
     function frameOf(c) {
-        for (var i = 0; i < frames.length; i++) if (frames[i].canvas === c) return frames[i];
-        return null;
+        return drawings().find(d => d.canvas === c) || null;
     }
 
     // Draws onto the frame's image: everything after undo/clear, only the dirty area after
@@ -344,16 +514,44 @@ Rectangle {
         if (ms > 10) console.log("[Animator][perf] paint", mode, drawn, "strokes", ms, "ms");
     }
 
-    // Onion skin: earlier frames drawn in lighter greys, each step back half as dark
-    // (50%, 25%, 12.5%). Baked as solid colors because item opacity is unreliable on e-paper.
+    // Onion skin: the current layer's earlier drawings in lighter greys, each step back half as
+    // dark (50%, 25%, 12.5%), and its next drawing in light blue. Baked as solid colors because
+    // item opacity is unreliable on e-paper.
     function paintOnion(c) {
         var ctx = c.getContext("2d");
-        if (!ctx) return;
+        if (!ctx || !frameCount) return;
         ctx.clearRect(0, 0, c.width, c.height);
-        for (var back = onionDepth; back >= 1; back--) {
-            var f = frames[current - back];
-            if (!f) continue;
-            for (var i = 0; i < f.strokes.length; i++) drawStroke(ctx, f.strokes[i], Math.pow(0.5, back));
+        var cels = layers[currentLayer].cels, i = current, earlier = [];
+        while (i >= 0 && !cels[i]) i--; // where the drawing on screen starts
+        while (--i >= 0 && earlier.length < onionDepth) if (cels[i]) earlier.push(cels[i]);
+        for (var back = earlier.length; back >= 1; back--) {
+            var f = earlier[back - 1];
+            for (var k = 0; k < f.strokes.length; k++) drawStroke(ctx, f.strokes[k], Math.pow(0.5, back));
+        }
+        var next = cels.slice(current + 1).find(d => d);
+        if (next) for (var n = 0; n < next.strokes.length; n++) drawStroke(ctx, next.strokes[n], 0.5, nextInk);
+    }
+
+    // A drawing in miniature (thin lines, every few points), centred in the canvas; pts is either
+    // [{x, y}] or flat [x, y, ...] (the project list's thumbnails)
+    function paintThumb(c, strokes) {
+        var ctx = c.getContext("2d");
+        if (!ctx) return;
+        ctx.reset();
+        var k = Math.min(c.width / stage.width, c.height / stage.height);
+        ctx.translate((c.width - stage.width * k) / 2, (c.height - stage.height * k) / 2);
+        ctx.scale(k, k);
+        ctx.lineWidth = 1.5 / k; ctx.lineCap = "round"; ctx.lineJoin = "round";
+        for (var i = 0; i < strokes.length; i++) {
+            var s = strokes[i], flat = !s.pts, pts = flat ? s : s.pts, n = flat ? pts.length / 2 : pts.length;
+            if (!n) continue;
+            var at = j => flat ? [pts[2 * j], pts[2 * j + 1]] : [pts[j].x, pts[j].y];
+            ctx.strokeStyle = flat ? "black" : s.color;
+            ctx.beginPath();
+            ctx.moveTo.apply(ctx, at(0));
+            for (var j = flat ? 1 : thumbStep; j < n; j += flat ? 1 : thumbStep) ctx.lineTo.apply(ctx, at(j));
+            ctx.lineTo.apply(ctx, at(n - 1));
+            ctx.stroke();
         }
     }
 
@@ -367,8 +565,12 @@ Rectangle {
         return out;
     }
 
-    function drawStroke(ctx, s, strength) {
-        var pts = s.pts, color = strength ? fade(s.color, strength) : s.color;
+    // Any ink but black is planning (older animations used a darker grey)
+    function isPlanning(s) { return s.color !== "#000000"; }
+
+    function drawStroke(ctx, s, strength, tint) {
+        if (!showPlanning && isPlanning(s)) return;
+        var pts = s.pts, color = strength ? fade(tint || s.color, strength) : s.color;
         ctx.globalCompositeOperation = s.tool === "area" ? "destination-out" : "source-over";
         ctx.strokeStyle = color;
         ctx.fillStyle = color;
@@ -391,18 +593,40 @@ Rectangle {
         ctx.globalCompositeOperation = "source-over";
     }
 
-    // The e-paper renderer doesn't draw rotated Rectangles, so the live line is a chain of
-    // unrotated round dots, close enough to overlap into a solid line
+    // The live line goes into Canvas tiles created under the pen as it moves: a handful of
+    // items however long the stroke, so nothing is baked until pen-up, and each move
+    // repaints only the small area it touches
     function addSegment(s, a, b) {
-        var len = Math.hypot(b.x - a.x, b.y - a.y);
-        var n = Math.max(1, Math.ceil(len / Math.max(1, Math.min(a.w, b.w) * 0.35)));
-        for (var k = 1; k <= n; k++) {
-            var t = k / n, w = a.w + (b.w - a.w) * t;
-            s.items.push(segComp.createObject(liveLayer, {
-                x: a.x + (b.x - a.x) * t - w / 2, y: a.y + (b.y - a.y) * t - w / 2,
-                width: w, height: w, radius: w / 2, color: s.color
-            }));
+        var r = Math.max(a.w, b.w) / 2 + 1, T = liveTile;
+        var x0 = Math.min(a.x, b.x) - r, y0 = Math.min(a.y, b.y) - r;
+        var x1 = Math.max(a.x, b.x) + r, y1 = Math.max(a.y, b.y) + r;
+        for (var col = Math.floor(x0 / T); col <= Math.floor(x1 / T); col++) {
+            for (var row = Math.floor(y0 / T); row <= Math.floor(y1 / T); row++) {
+                var key = col + "," + row, t = s.tiles[key];
+                if (!t) t = s.tiles[key] = { canvas: tileComp.createObject(liveLayer, { x: col * T, y: row * T }), segs: [] };
+                t.segs.push([a, b]);
+                t.canvas.markDirty(Qt.rect(x0 - col * T, y0 - row * T, x1 - x0, y1 - y0));
+            }
         }
+    }
+
+    function paintTile(c) {
+        var t = null, ctx = c.getContext("2d");
+        if (live) for (var k in live.tiles) if (live.tiles[k].canvas === c) t = live.tiles[k];
+        if (!t || !ctx) return; // after pen-up the frame image has the ink
+        ctx.strokeStyle = live.color;
+        ctx.fillStyle = live.color;
+        ctx.lineCap = "round";
+        for (var i = 0; i < t.segs.length; i++) {
+            var a = t.segs[i][0], b = t.segs[i][1];
+            ctx.beginPath();
+            if (a === b) { ctx.arc(a.x - c.x, a.y - c.y, a.w / 2, 0, 2 * Math.PI); ctx.fill(); continue; }
+            ctx.lineWidth = b.w;
+            ctx.moveTo(a.x - c.x, a.y - c.y);
+            ctx.lineTo(b.x - c.x, b.y - c.y);
+            ctx.stroke();
+        }
+        t.segs = [];
     }
 
     // ---------------------------------------------------------------
@@ -420,11 +644,18 @@ Rectangle {
         historyRev++;
     }
 
+    // Every change to a frame's strokes goes through here, so autosave can send just the change
+    function spliceStrokes(f, at, del, ins) {
+        f.strokes.splice.apply(f.strokes, [at, del].concat(ins));
+        if (f.edits) f.edits.push([at, del, ins]);
+        f.rev++;
+    }
+
     function undo() {
         var f = frame, op = f && f.undo.pop();
         if (!op) return;
-        if (op.t === "add") f.strokes.splice(f.strokes.indexOf(op.s), 1);
-        else f.strokes = op.before.slice();
+        if (op.t === "add") spliceStrokes(f, f.strokes.indexOf(op.s), 1, []);
+        else spliceStrokes(f, 0, f.strokes.length, op.before);
         f.redo.push(op);
         repaint(f);
         historyRev++;
@@ -433,8 +664,8 @@ Rectangle {
     function redo() {
         var f = frame, op = f && f.redo.pop();
         if (!op) return;
-        if (op.t === "add") f.strokes.push(op.s);
-        else f.strokes = op.after.slice();
+        if (op.t === "add") spliceStrokes(f, f.strokes.length, 0, [op.s]);
+        else spliceStrokes(f, 0, f.strokes.length, op.after);
         f.undo.push(op);
         repaint(f);
         historyRev++;
@@ -444,7 +675,7 @@ Rectangle {
         var f = frame;
         if (!f.strokes.length) return;
         pushOp({ t: "swap", before: f.strokes.slice(), after: [] });
-        f.strokes = [];
+        spliceStrokes(f, 0, f.strokes.length, []);
         repaint(f);
     }
 
@@ -468,6 +699,7 @@ Rectangle {
         var R = 16, strokes = frame.strokes, hitAny = false;
         for (var i = strokes.length - 1; i >= 0; i--) {
             var s = strokes[i], b = bounds(s), reach = R + b.w / 2;
+            if (!showPlanning && isPlanning(s)) continue; // don't rub out what you can't see
             if (x < b.x0 - reach || x > b.x1 + reach || y < b.y0 - reach || y > b.y1 + reach) continue;
             var pieces = [], run = [], hit = false;
             for (var j = 0; j < s.pts.length; j++) {
@@ -483,7 +715,7 @@ Rectangle {
             var repl = [];
             for (var k = 0; k < pieces.length; k++)
                 if (pieces[k].length > 1 || s.pts.length === 1) repl.push({ tool: s.tool, color: s.color, pts: pieces[k] });
-            strokes.splice.apply(strokes, [i, 1].concat(repl));
+            spliceStrokes(frame, i, 1, repl);
             hitAny = true;
         }
         if (hitAny) {
@@ -506,12 +738,13 @@ Rectangle {
             return;
         }
         var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
-        live = { tool: "pen", color: inkColor, pts: [p], items: [], baked: 0 };
+        live = { tool: "pen", color: inkColor, pts: [p], tiles: {} };
         addSegment(live, p, p);
     }
 
     function moveGesture(pt) {
         var t0 = Date.now();
+        if (live && !moveWaiting) moveWaiting = t0;
         moveGestureImpl(pt);
         var g = live || eraseOp;
         if (g) { g.ms = (g.ms || 0) + Date.now() - t0; g.ev = (g.ev || 0) + 1; }
@@ -533,17 +766,6 @@ Rectangle {
         var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
         live.pts.push(p);
         addSegment(live, last, p);
-        if (live.items.length >= 400) bakeLive();
-    }
-
-    // Long strokes would pile up thousands of preview items and stall xochitl (its watchdog
-    // reboots the tablet after a minute), so bake what's drawn so far into the frame image
-    function bakeLive() {
-        var f = frame;
-        f.trash = f.trash.concat(live.items);
-        queueStroke(f, { tool: live.tool, color: live.color, pts: live.pts.slice(live.baked) });
-        live.items = [];
-        live.baked = live.pts.length - 1; // next chunk starts at the last baked point
     }
 
     function endGesture() {
@@ -551,14 +773,17 @@ Rectangle {
         if (liveErasing && eraseOp.hit) pushOp({ t: "swap", before: eraseOp.before, after: frame.strokes.slice() });
         if (live) {
             var f = frame, s = { tool: live.tool, color: live.color, pts: live.pts };
-            f.strokes.push(s);
-            f.trash = f.trash.concat(live.items);
-            queueStroke(f, { tool: s.tool, color: s.color, pts: s.pts.slice(live.baked) });
+            spliceStrokes(f, f.strokes.length, 0, [s]);
+            for (var k in live.tiles) f.trash.push(live.tiles[k].canvas);
+            queueStroke(f, s);
             pushOp({ t: "add", s: s });
-            console.log("[Animator][perf] stroke", s.pts.length, "pts,", live.ev || 0, "moves,",
-                        live.ms || 0, "ms JS (", ((live.ms || 0) / Math.max(1, live.ev || 0)).toFixed(1), "ms/move )");
+            console.log("[Animator][perf] stroke", s.pts.length, "pts,", Object.keys(live.tiles).length, "tiles,", live.ev || 0, "moves,",
+                        live.ms || 0, "ms JS (", ((live.ms || 0) / Math.max(1, live.ev || 0)).toFixed(1), "ms/move ),",
+                        live.frames || 0, "frames, move->frame avg", ((live.lat || 0) / Math.max(1, live.frames || 0)).toFixed(0),
+                        "ms max", live.latMax || 0, "ms");
         }
         live = null;
+        moveWaiting = 0;
         eraseOp = null;
         liveErasing = false;
     }
@@ -569,26 +794,44 @@ Rectangle {
     component Btn: Rectangle {
         id: btn
         property string label
+        property string icon            // an Icon name, shown before the label
         property bool on: false
+        property bool flat: false       // toolbar style: no outline, solid black when on
         property bool enabledLook: true
+        property int fontSize: 21
+        readonly property color ink: on ? "white" : (enabledLook ? "black" : "#aaaaaa")
         signal tap
-        width: Math.max(60, txt.implicitWidth + 26)
+        signal hold
+        width: Math.max(60, content.implicitWidth + 26)
         height: 58
         radius: 8
         color: on ? "black" : "white"
         border.color: "black"
-        border.width: 2
-        Text {
-            id: txt
+        border.width: flat ? 0 : 2
+        Row {
+            id: content
             anchors.centerIn: parent
-            text: btn.label
-            font.pixelSize: 21
-            font.bold: true
-            color: btn.on ? "white" : (btn.enabledLook ? "black" : "#aaaaaa")
+            spacing: 6
+            Loader {
+                active: btn.icon !== ""
+                visible: active
+                anchors.verticalCenter: parent.verticalCenter
+                sourceComponent: Icon { name: btn.icon; ink: btn.ink }
+            }
+            Text {
+                visible: btn.label !== ""
+                anchors.verticalCenter: parent.verticalCenter
+                text: btn.label
+                font.pixelSize: btn.fontSize
+                font.bold: true
+                color: btn.ink
+            }
         }
         TapHandler {
+            acceptedDevices: PointerDevice.AllDevices & ~PointerDevice.TouchScreen // palms and fingers are touch; the pen is mouse or stylus to Qt
             gesturePolicy: TapHandler.ReleaseWithinBounds
             onTapped: btn.tap()
+            onLongPressed: btn.hold()
         }
     }
 
@@ -609,27 +852,64 @@ Rectangle {
     // ---------------------------------------------------------------
     // TOP: app actions + tools
     // ---------------------------------------------------------------
-    // Undo arrow drawn on a Canvas (the tablet font may lack arrow glyphs); mirrored = redo
-    component ArrowIcon: Canvas {
-        property bool mirrored: false
+    // Thin outline icons drawn on a Canvas (the tablet font may lack the glyphs, and its scene
+    // graph only draws rectangles, images, text and painted items)
+    component Icon: Canvas {
+        property string name
         property color ink: "black"
         width: 36; height: 36
         onInkChanged: requestPaint()
+        onNameChanged: requestPaint()
         onPaint: {
             var c = getContext("2d");
             c.reset();
-            if (mirrored) { c.translate(width, 0); c.scale(-1, 1); }
             c.strokeStyle = ink; c.fillStyle = ink;
-            c.lineWidth = 4; c.lineCap = "round"; c.lineJoin = "round";
+            c.lineWidth = 3; c.lineCap = "round"; c.lineJoin = "round";
             c.beginPath();
-            c.moveTo(12, 11); c.lineTo(22, 11);
-            c.arc(22, 19.5, 8.5, -Math.PI / 2, Math.PI / 2, false);
-            c.lineTo(11, 28);
+            switch (name) {
+            case "redo": c.translate(width, 0); c.scale(-1, 1); // then draw the undo arrow mirrored
+            case "undo":
+                c.moveTo(12, 11); c.lineTo(22, 11); c.arc(22, 19.5, 8.5, -Math.PI / 2, Math.PI / 2, false); c.lineTo(11, 28);
+                c.stroke();
+                c.beginPath(); c.moveTo(4, 11); c.lineTo(13, 4); c.lineTo(13, 18); c.closePath(); c.fill();
+                return;
+            case "eraser": // a tilted block, its tip marked off
+                c.moveTo(6, 22); c.lineTo(19, 9); c.lineTo(30, 20); c.lineTo(17, 33); c.closePath();
+                c.moveTo(12, 16); c.lineTo(23, 27); break;
+            case "eye-off": c.moveTo(7, 29); c.lineTo(29, 7); // then the eye, struck through
+            case "eye":
+                c.moveTo(4, 18); c.quadraticCurveTo(18, 4, 32, 18); c.quadraticCurveTo(18, 32, 4, 18);
+                c.moveTo(23, 18); c.arc(18, 18, 5, 0, 2 * Math.PI); break;
+            case "hold": // a drawing held along the timeline
+                c.rect(4, 11, 14, 14); c.moveTo(18, 18); c.lineTo(32, 18); break;
+            case "shift": // an outlined arrow up
+                c.moveTo(18, 5); c.lineTo(31, 18); c.lineTo(24, 18); c.lineTo(24, 30); c.lineTo(12, 30);
+                c.lineTo(12, 18); c.lineTo(5, 18); c.closePath(); break;
+            case "backspace":
+                c.moveTo(4, 18); c.lineTo(12, 8); c.lineTo(32, 8); c.lineTo(32, 28); c.lineTo(12, 28); c.closePath();
+                c.moveTo(17, 13); c.lineTo(26, 23); c.moveTo(26, 13); c.lineTo(17, 23); break;
+            case "close": c.moveTo(9, 9); c.lineTo(27, 27); c.moveTo(27, 9); c.lineTo(9, 27); break;
+            case "projects": c.rect(6, 6, 10, 10); c.rect(20, 6, 10, 10); c.rect(6, 20, 10, 10); c.rect(20, 20, 10, 10); break;
+            case "share": // arrow up out of a tray
+                c.moveTo(18, 22); c.lineTo(18, 5); c.moveTo(11, 12); c.lineTo(18, 5); c.lineTo(25, 12);
+                c.moveTo(11, 16); c.lineTo(6, 16); c.lineTo(6, 31); c.lineTo(30, 31); c.lineTo(30, 16); c.lineTo(25, 16); break;
+            case "prev": c.moveTo(22, 8); c.lineTo(12, 18); c.lineTo(22, 28); break;
+            case "next": c.moveTo(14, 8); c.lineTo(24, 18); c.lineTo(14, 28); break;
+            case "play": c.moveTo(11, 7); c.lineTo(28, 18); c.lineTo(11, 29); c.closePath(); c.fill(); return;
+            case "stop": c.rect(10, 10, 16, 16); c.fill(); return;
+            case "new": c.rect(8, 5, 20, 26); c.moveTo(18, 12); c.lineTo(18, 24); c.moveTo(12, 18); c.lineTo(24, 18); break;
+            case "copy": c.rect(13, 11, 16, 21); c.moveTo(8, 26); c.lineTo(8, 5); c.lineTo(23, 5); break;
+            case "delete": // trash can
+                c.moveTo(6, 9); c.lineTo(30, 9); c.moveTo(14, 9); c.lineTo(14, 5); c.lineTo(22, 5); c.lineTo(22, 9);
+                c.moveTo(9, 9); c.lineTo(11, 31); c.lineTo(25, 31); c.lineTo(27, 9);
+                c.moveTo(15, 14); c.lineTo(15, 26); c.moveTo(21, 14); c.lineTo(21, 26); break;
+            case "onion": // the current frame over fainter earlier ones
+                c.arc(23, 18, 9, 0, 2 * Math.PI); c.stroke();
+                c.globalAlpha = 0.45; c.beginPath(); c.arc(16, 18, 9, Math.PI / 2, 3 * Math.PI / 2); c.stroke();
+                c.globalAlpha = 0.25; c.beginPath(); c.arc(9, 18, 7, Math.PI / 2, 3 * Math.PI / 2);
+                break;
+            }
             c.stroke();
-            c.beginPath();
-            c.moveTo(3, 11); c.lineTo(13, 3); c.lineTo(13, 19);
-            c.closePath();
-            c.fill();
         }
     }
 
@@ -645,8 +925,8 @@ Rectangle {
             id: leftGroup
             x: 8; y: 8
             spacing: 8
-            Btn { label: "Exit"; onTap: root.close() }
-            Btn { label: "Projects"; onTap: root.showProjects = true }
+            Btn { icon: "close"; flat: true; onTap: root.close() }
+            Btn { icon: "projects"; flat: true; onTap: root.showProjects = true }
         }
         Text {
             anchors.left: leftGroup.right; anchors.right: rightGroup.left
@@ -654,9 +934,9 @@ Rectangle {
             height: parent.height
             verticalAlignment: Text.AlignVCenter
             text: root.projectName
-            font.pixelSize: 24; font.bold: true; font.underline: true
+            font.pixelSize: 24; font.bold: true
             elide: Text.ElideRight
-            TapHandler { onTapped: root.startRename() }
+            TapHandler { acceptedDevices: PointerDevice.AllDevices & ~PointerDevice.TouchScreen; onTapped: root.startRename() }
         }
         Row {
             id: rightGroup
@@ -667,8 +947,9 @@ Rectangle {
                 model: root.sizes.length
                 Btn {
                     on: root.sizeIndex === index
+                    flat: true
                     width: 58
-                    onTap: root.sizeIndex = index
+                    onTap: { root.sizeIndex = index; root.eraserTool = false; }
                     Rectangle {
                         anchors.centerIn: parent
                         width: 6 + index * 10; height: width; radius: width / 2
@@ -676,26 +957,22 @@ Rectangle {
                     }
                 }
             }
+            Item { width: 12; height: 1 } // gap between groups
             Repeater {
-                model: ["#000000", "#808080"]
+                model: ["#000000", root.planInk]
                 Btn {
+                    on: root.inkColor === modelData && !root.eraserTool
+                    flat: true
                     width: 58
-                    border.width: root.inkColor === modelData ? 6 : 2
-                    onTap: root.inkColor = modelData
-                    Rectangle { anchors.centerIn: parent; width: 30; height: 30; radius: 4; color: modelData }
+                    onTap: { root.inkColor = modelData; root.eraserTool = false; if (index) root.showPlanning = true; }
+                    Rectangle { anchors.centerIn: parent; width: 30; height: 30; radius: 6; color: modelData; border.color: "white"; border.width: 2 }
                 }
             }
-            Btn {
-                width: 58
-                onTap: root.undo()
-                ArrowIcon { anchors.centerIn: parent; ink: root.canUndo ? "black" : "#aaaaaa" }
-            }
-            Btn {
-                width: 58
-                onTap: root.redo()
-                ArrowIcon { anchors.centerIn: parent; mirrored: true; ink: root.canRedo ? "black" : "#aaaaaa" }
-            }
-            Btn { label: "Export"; on: true; onTap: root.startExport() }
+            Btn { icon: "eraser"; flat: true; width: 58; on: root.eraserTool; onTap: root.eraserTool = !root.eraserTool }
+            Item { width: 12; height: 1 } // gap between groups
+            Btn { icon: "undo"; flat: true; width: 58; enabledLook: root.canUndo; onTap: root.undo() }
+            Btn { icon: "redo"; flat: true; width: 58; enabledLook: root.canRedo; onTap: root.redo() }
+            Btn { icon: "share"; flat: true; width: 58; onTap: root.chooseExport() }
         }
         Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 2; color: "black" }
     }
@@ -725,10 +1002,12 @@ Rectangle {
         }
         Item { id: liveLayer; anchors.fill: parent; z: 1 } // pen preview above the frames
 
-        // Tell xochitl which e-ink waveform to use for this region
+        // Tell xochitl which e-ink waveform to use for this region. UFast puts the live stroke
+        // on the panel noticeably sooner; it's 1-bit, so grey ink settles when Fast takes over
         DisplayMethodArea {
             anchors.fill: parent
-            displayMethod: root.isPlaying ? DisplayMethodArea.Animate : DisplayMethodArea.Fast
+            displayMethod: root.isPlaying ? DisplayMethodArea.Animate
+                         : root.live ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
         }
 
         // The Marker reaches AppLoad apps as plain (non-synthesized) mouse events. Fingers
@@ -741,7 +1020,7 @@ Rectangle {
             onPressed: (m) => {
                 if (m.source !== Qt.MouseEventNotSynthesized) { m.accepted = false; return; }
                 root.beginGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure },
-                                  root.penEraser || m.button !== Qt.LeftButton);
+                                  root.eraserTool || root.penEraser || m.button !== Qt.LeftButton);
             }
             onPositionChanged: (m) => root.moveGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure })
             onReleased: root.endGesture()
@@ -761,64 +1040,177 @@ Rectangle {
 
         Rectangle { width: parent.width; height: 2; color: "black" }
 
-        ListView {
-            id: strip
+        Row {
             width: parent.width
-            height: 64
-            orientation: ListView.Horizontal
-            spacing: 6
-            leftMargin: 8; rightMargin: 8
-            model: root.frameCount
-            currentIndex: root.current
-            onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
 
-            // Press and hold a frame, then drag it left/right to retime the animation
-            property int dragFrom: -1
-            property int dragTo: -1
-            interactive: dragFrom < 0
-
-            delegate: Rectangle {
-                y: 6
-                width: 52; height: 52; radius: 6
-                color: index === strip.dragFrom ? "#bbbbbb" : index === root.current ? "black" : "white"
-                border.color: "black"
-                border.width: strip.dragFrom >= 0 && index === strip.dragTo ? 6 : 2
-                Text {
-                    anchors.centerIn: parent
-                    text: index + 1
-                    font.pixelSize: 20; font.bold: true
-                    color: index === root.current && index !== strip.dragFrom ? "white" : "black"
+            // One header per layer: tap to draw on it (again to rename it), hold to delete it; the eye hides it
+            Column {
+                id: layerHeads
+                topPadding: 6; leftPadding: 8
+                spacing: 6
+                Repeater {
+                    model: root.layerCount
+                    Row {
+                        spacing: 2
+                        Btn {
+                            id: layerBtn
+                            property bool armed: false
+                            width: 130; height: 52
+                            label: armed ? "Delete?" : root.historyRev >= 0 && root.layers[index] ? root.layers[index].name : ""
+                            on: index === root.currentLayer || armed
+                            onTap: {
+                                if (armed) { armed = false; root.deleteLayer(index); }
+                                else if (index === root.currentLayer) root.startRename(index);
+                                else root.currentLayer = index;
+                            }
+                            onHold: if (root.layerCount > 1) { armed = true; disarmLayer.restart(); }
+                            Timer { id: disarmLayer; interval: 3000; onTriggered: layerBtn.armed = false }
+                        }
+                        Btn {
+                            width: 44; height: 52; flat: true
+                            icon: root.historyRev >= 0 && root.layers[index] && root.layers[index].visible ? "eye" : "eye-off"
+                            onTap: root.toggleLayer(index)
+                        }
+                    }
                 }
-                MouseArea {
-                    anchors.fill: parent
-                    pressAndHoldInterval: 350
-                    preventStealing: strip.dragFrom >= 0
-                    onClicked: root.goTo(index)
-                    onPressAndHold: { strip.dragFrom = index; strip.dragTo = index; }
-                    onPositionChanged: (m) => {
-                        if (strip.dragFrom < 0) return;
-                        var p = mapToItem(strip.contentItem, m.x, m.y);
-                        strip.dragTo = Math.max(0, Math.min(root.frameCount - 1, Math.floor((p.x + 3) / 58)));
+                Btn {
+                    visible: root.layerCount < root.maxLayers
+                    width: 176; height: 40
+                    label: "+ Layer"
+                    onTap: root.addLayer()
+                }
+            }
+
+            ListView {
+                id: strip
+                width: parent.width - layerHeads.width
+                height: layerHeads.height
+                orientation: ListView.Horizontal
+                spacing: 6
+                leftMargin: 8; rightMargin: 8
+                model: root.frameCount
+                currentIndex: root.current
+                onCurrentIndexChanged: positionViewAtIndex(currentIndex, ListView.Contain)
+
+                // Press and hold a frame, then drag it left/right to retime the animation
+                property int dragFrom: -1
+                property int dragTo: -1
+                property int scrollSlop: 24 // px the pen may wander during a hold before it scrolls instead
+                interactive: false // the pen scrolls it below; a palm mustn't
+
+                // One column per frame, one cell per layer: a thumbnail where a drawing starts (its
+                // number in the corner), a line where the layer holds it
+                delegate: Item {
+                    id: column
+                    property int frameIndex: index
+                    y: 6
+                    width: 52; height: root.layerCount * 58 - 6
+                    Repeater {
+                        model: root.layerCount
+                        Item {
+                            readonly property var cels: root.historyRev >= 0 && root.layers[index] ? root.layers[index].cels : []
+                            readonly property bool drawn: root.historyRev >= 0 && !!cels[column.frameIndex] // same array after edits: re-read on each
+                            readonly property bool here: column.frameIndex === root.current
+                            readonly property bool mine: here && index === root.currentLayer
+                            readonly property var drawing: root.historyRev >= 0 && drawn ? cels[column.frameIndex] : null
+                            y: index * 58
+                            width: 52; height: 52
+                            Rectangle { // held: the drawing carries on
+                                visible: !parent.drawn
+                                x: -3; width: 58; height: 4
+                                anchors.verticalCenter: parent.verticalCenter
+                                color: "black"
+                            }
+                            Rectangle {
+                                id: cellBox
+                                readonly property Item cell: parent
+                                visible: cell.drawn || cell.here
+                                anchors.fill: parent; radius: 6
+                                color: column.frameIndex === strip.dragFrom ? "#bbbbbb" : cell.drawn ? "white" : "transparent"
+                                border.color: "black"
+                                border.width: strip.dragFrom >= 0 && column.frameIndex === strip.dragTo ? 6 : cell.here ? 4 : 2
+                                Canvas {
+                                    anchors.fill: parent; anchors.margins: 4
+                                    visible: cellBox.cell.drawn
+                                    renderTarget: Canvas.Image
+                                    // Redraws when its drawing changes: at once for another drawing, after the pen rests for edits
+                                    readonly property string stamp: root.thumbRev >= 0 && cellBox.cell.drawing
+                                                                    ? cellBox.cell.drawing.key + ":" + cellBox.cell.drawing.rev : ""
+                                    onStampChanged: requestPaint()
+                                    onPaint: root.paintThumb(this, cellBox.cell.drawing ? cellBox.cell.drawing.strokes : [])
+                                }
+                                Rectangle { // the drawing's number within its layer; black on the one under the pen
+                                    visible: cellBox.cell.drawn
+                                    width: Math.max(18, num.implicitWidth + 6); height: 18; radius: 4
+                                    color: cellBox.cell.mine ? "black" : "white"
+                                    border.color: "black"; border.width: 1
+                                    Text {
+                                        id: num
+                                        anchors.centerIn: parent
+                                        text: root.historyRev >= 0 && cellBox.cell.cels.slice(0, column.frameIndex + 1).filter(d => d).length
+                                        font.pixelSize: 13; font.bold: true
+                                        color: cellBox.cell.mine ? "white" : "black"
+                                    }
+                                }
+                            }
+                        }
                     }
-                    onReleased: {
-                        if (strip.dragFrom >= 0) root.moveFrame(strip.dragFrom, strip.dragTo);
-                        strip.dragFrom = -1;
+                    // The pen jitters past Qt's drag distance (~1 mm here) before a hold fires, which
+                    // let the ListView steal the press. Keep the press and scroll the strip ourselves.
+                    MouseArea {
+                        anchors.fill: parent
+                        pressAndHoldInterval: 350
+                        preventStealing: true
+                        property real pressX
+                        property real pressContentX
+                        property bool scrolling: false
+                        onPressed: (m) => {
+                            if (m.source !== Qt.MouseEventNotSynthesized) { m.accepted = false; return; } // palm
+                            pressX = mapToItem(strip, m.x, 0).x;
+                            pressContentX = strip.contentX;
+                            scrolling = false;
+                        }
+                        onClicked: (m) => {
+                            if (scrolling) return;
+                            root.goTo(index);
+                            root.currentLayer = Math.max(0, Math.min(root.layerCount - 1, Math.floor(m.y / 58)));
+                        }
+                        onPressAndHold: if (!scrolling) { strip.dragFrom = index; strip.dragTo = index; }
+                        onPositionChanged: (m) => {
+                            if (strip.dragFrom < 0) {
+                                var dx = mapToItem(strip, m.x, 0).x - pressX;
+                                if (Math.abs(dx) > strip.scrollSlop) scrolling = true;
+                                if (!scrolling) return;
+                                var minX = strip.originX - strip.leftMargin;
+                                var maxX = Math.max(minX, strip.originX + strip.contentWidth + strip.rightMargin - strip.width);
+                                strip.contentX = Math.max(minX, Math.min(maxX, pressContentX - dx));
+                                return;
+                            }
+                            var p = mapToItem(strip.contentItem, m.x, m.y);
+                            strip.dragTo = Math.max(0, Math.min(root.frameCount - 1, Math.floor((p.x + 3) / 58)));
+                        }
+                        onReleased: {
+                            if (strip.dragFrom >= 0) root.moveFrame(strip.dragFrom, strip.dragTo);
+                            strip.dragFrom = -1;
+                        }
+                        onCanceled: strip.dragFrom = -1
                     }
-                    onCanceled: strip.dragFrom = -1
                 }
             }
         }
 
         Bar {
-            Btn { label: "◀"; onTap: root.goTo(root.current - 1) }
-            Btn { label: root.isPlaying ? "Stop" : "Play"; on: root.isPlaying; onTap: root.isPlaying = !root.isPlaying }
-            Btn { label: "▶"; onTap: root.goTo(root.current + 1) }
-            Btn { label: "+ New"; onTap: root.insertFrame(root.current + 1, null) }
-            Btn { label: "+ Copy"; onTap: root.insertFrame(root.current + 1, root.frame) }
+            Btn { icon: "prev"; flat: true; onTap: root.goTo(root.current - 1) }
+            Btn { icon: root.isPlaying ? "stop" : "play"; flat: true; on: root.isPlaying; onTap: root.isPlaying = !root.isPlaying }
+            Btn { icon: "next"; flat: true; onTap: root.goTo(root.current + 1) }
+            Btn { icon: "new"; flat: true; onTap: root.insertFrame(root.current + 1, null) }
+            Btn { icon: "copy"; flat: true; onTap: root.insertFrame(root.current + 1, root.frame) }
             Btn {
                 id: delBtn
                 property bool armed: false
-                label: armed ? "Sure?" : "Delete"
+                icon: "delete"
+                label: armed ? "Sure?" : ""
+                flat: true
                 on: armed
                 onTap: {
                     if (armed) { armed = false; root.deleteFrame(); }
@@ -827,11 +1219,40 @@ Rectangle {
                 Timer { id: disarm; interval: 3000; onTriggered: delBtn.armed = false }
             }
             Btn {
-                label: root.onionDepth ? "Onion: " + root.onionDepth : "Onion: Off"
+                id: holdBtn
+                property bool armed: false
+                readonly property bool held: root.historyRev >= 0 && root.layerCount > 0 && root.current < root.frameCount
+                                             && !root.layers[root.currentLayer].cels[root.current]
+                icon: "hold"
+                label: armed ? "Sure?" : "Hold"
+                flat: true
+                on: held || armed
+                enabledLook: root.current > 0
+                onTap: {
+                    if (root.current === 0) return;
+                    // making a hold drops this frame's own drawing, so ask first if it has ink
+                    if (!held && !armed && root.frame.strokes.length) { armed = true; disarmHold.restart(); return; }
+                    armed = false;
+                    root.toggleHold();
+                }
+                Timer { id: disarmHold; interval: 3000; onTriggered: holdBtn.armed = false }
+            }
+            Btn {
+                icon: "onion"
+                label: root.onionDepth ? root.onionDepth : "Off"
+                flat: true
+                enabledLook: root.onionDepth > 0
                 onTap: root.onionDepth = (root.onionDepth + 1) % 4
             }
-            Btn { label: root.fps + " fps"; onTap: root.fpsIndex = (root.fpsIndex + 1) % root.fpsOptions.length }
-            Btn { label: "Clear frame"; onTap: root.clearFrame() }
+            Btn {
+                icon: root.showPlanning ? "eye" : "eye-off"
+                label: "Plan"
+                flat: true
+                enabledLook: root.showPlanning
+                onTap: root.showPlanning = !root.showPlanning
+            }
+            Btn { label: root.fps + " fps"; flat: true; onTap: root.fpsIndex = (root.fpsIndex + 1) % root.fpsOptions.length }
+            Btn { label: "Clear"; flat: true; onTap: root.clearFrame() }
         }
     }
 
@@ -846,11 +1267,19 @@ Rectangle {
         MouseArea { anchors.fill: parent }
 
         Column {
-            anchors.centerIn: parent
+            x: 16; y: 16
             width: parent.width - 32
             spacing: 14
 
-            Text { text: "Rename animation"; font.pixelSize: 28; font.bold: true }
+            Item {
+                width: parent.width; height: 58
+                Btn { label: "Cancel"; flat: true; onTap: root.showRename = false }
+                Text {
+                    anchors.centerIn: parent
+                    text: root.renameLayer < 0 ? "Rename animation" : "Rename layer"
+                    font.pixelSize: 28; font.bold: true
+                }
+            }
             Rectangle {
                 width: parent.width; height: 80
                 border.color: "black"; border.width: 3; radius: 8
@@ -862,28 +1291,58 @@ Rectangle {
                     elide: Text.ElideLeft
                 }
             }
-            Repeater {
-                model: ["1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"]
-                Row {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    spacing: 6
-                    Repeater {
-                        model: modelData.split("")
+        }
+
+        // Docked at the bottom like reMarkable's: white keys on grey, lower case unless Shift
+        Rectangle {
+            anchors.bottom: parent.bottom
+            width: parent.width
+            height: keys.height + 24
+            color: "#e0e0e0"
+            Column {
+                id: keys
+                x: 12; y: 12
+                width: parent.width - 24
+                spacing: 8
+                readonly property real keyW: (width - 9 * 8) / 10
+                Repeater {
+                    model: root.kbNumbers ? ["1234567890", "-/:;()&@'#", ".,?!"] : ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+                    Row {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        spacing: 8
                         Btn {
-                            width: (root.width - 32 - 9 * 6) / 10; height: 72
-                            label: modelData.toUpperCase()
-                            onTap: root.typeKey(modelData)
+                            visible: index === 2 && !root.kbNumbers
+                            icon: "shift"; flat: true; on: root.kbShift
+                            width: keys.keyW * 1.5; height: 80
+                            onTap: root.kbShift = !root.kbShift
+                        }
+                        Repeater {
+                            model: modelData.split("")
+                            Btn {
+                                flat: true
+                                width: keys.keyW; height: 80; fontSize: 28
+                                label: root.kbShift ? modelData.toUpperCase() : modelData
+                                onTap: root.typeKey(modelData)
+                            }
+                        }
+                        Btn {
+                            visible: index === 2
+                            icon: "backspace"; flat: true
+                            width: keys.keyW * 1.5; height: 80
+                            onTap: root.renameText = root.renameText.slice(0, -1)
                         }
                     }
                 }
-            }
-            Row {
-                anchors.horizontalCenter: parent.horizontalCenter
-                spacing: 6
-                Btn { label: "Cancel"; height: 72; onTap: root.showRename = false }
-                Btn { label: "Space"; height: 72; width: 240; onTap: root.typeKey(" ") }
-                Btn { label: "Delete"; height: 72; onTap: root.renameText = root.renameText.slice(0, -1) }
-                Btn { label: "Save"; height: 72; on: true; onTap: root.finishRename() }
+                Row {
+                    spacing: 8
+                    Btn {
+                        label: root.kbNumbers ? "abc" : "123"; flat: true
+                        width: keys.keyW * 1.5; height: 80
+                        onTap: root.kbNumbers = !root.kbNumbers
+                    }
+                    Btn { flat: true; width: keys.width - 3 * keys.keyW - 16; height: 80; onTap: root.typeKey(" ") }
+                    Btn { label: "Done"; on: true; width: keys.keyW * 1.5; height: 80; onTap: root.finishRename() }
+                }
             }
         }
     }
@@ -902,7 +1361,7 @@ Rectangle {
             id: projHeader
             width: parent.width
             Bar {
-                Btn { label: "Close"; onTap: root.showProjects = false }
+                Btn { icon: "close"; flat: true; onTap: root.showProjects = false }
                 Btn { label: "+ New animation"; on: true; onTap: root.newProject() }
                 Text {
                     height: 58; verticalAlignment: Text.AlignVCenter
@@ -919,12 +1378,21 @@ Rectangle {
             clip: true
             model: root.projectIndex
             delegate: Rectangle {
+                id: projRow
+                property bool armed: false
                 width: ListView.view.width
                 height: 96
                 color: modelData.id === root.projectId ? "#e6e6e6" : "white"
+                Canvas { // frame 1 in miniature, kept in the index by the storage worker
+                    x: 16; y: 8
+                    width: Math.round(height * stage.width / Math.max(1, stage.height)); height: parent.height - 16
+                    renderTarget: Canvas.Image
+                    onPaint: root.paintThumb(this, modelData.thumb || [])
+                    Rectangle { anchors.fill: parent; color: "transparent"; border.color: "#aaaaaa"; border.width: 1 }
+                }
                 Column {
                     anchors.verticalCenter: parent.verticalCenter
-                    x: 24
+                    x: 136
                     spacing: 4
                     Text { text: modelData.name; font.pixelSize: 26; font.bold: true }
                     Text {
@@ -934,7 +1402,22 @@ Rectangle {
                     }
                 }
                 Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: "#aaaaaa" }
-                TapHandler { onTapped: root.openProject(modelData.id) }
+                Item { // tap the row to open it; the trash keeps its own taps
+                    width: trash.x; height: parent.height
+                    TapHandler { acceptedDevices: PointerDevice.AllDevices & ~PointerDevice.TouchScreen; onTapped: root.openProject(modelData.id) }
+                }
+                Btn {
+                    id: trash
+                    anchors.right: parent.right; anchors.rightMargin: 16
+                    anchors.verticalCenter: parent.verticalCenter
+                    icon: "delete"; label: projRow.armed ? "Delete?" : ""
+                    flat: true; on: projRow.armed
+                    onTap: {
+                        if (projRow.armed) root.deleteProject(modelData.id);
+                        else { projRow.armed = true; disarmRow.restart(); }
+                    }
+                    Timer { id: disarmRow; interval: 3000; onTriggered: projRow.armed = false }
+                }
             }
         }
     }
@@ -967,7 +1450,8 @@ Rectangle {
 
                 Text {
                     anchors.horizontalCenter: parent.horizontalCenter
-                    text: root.isExporting ? "Exporting..." : (root.exportedUrl !== "" ? "Your GIF is ready!" : "Export failed")
+                    text: !root.exportFormat ? "Share animation" : root.isExporting ? "Exporting..."
+                        : root.exportedUrl !== "" ? "Your " + root.exportFormats[root.exportFormat].label + " is ready!" : "Export failed"
                     font.pixelSize: 28; font.bold: true
                 }
 
@@ -1009,12 +1493,30 @@ Rectangle {
                     wrapMode: Text.WrapAnywhere
                 }
 
+                Row { // where the link points: an upload, or the tablet itself on Wi-Fi
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    spacing: 12
+                    visible: !root.exportFormat
+                    Btn { label: "Upload link"; on: !root.shareWifi; onTap: root.shareWifi = false }
+                    Btn { label: "Wi-Fi (no cloud)"; on: root.shareWifi; onTap: root.shareWifi = true }
+                }
+
+                Row { // pick a format
+                    anchors.horizontalCenter: parent.horizontalCenter
+                    spacing: 12
+                    visible: !root.exportFormat
+                    Repeater {
+                        model: ["gif", "svg", "zip", "pdf"]
+                        Btn { label: root.exportFormats[modelData].label; onTap: root.startExport(modelData) }
+                    }
+                }
+
                 Row {
                     anchors.horizontalCenter: parent.horizontalCenter
                     spacing: 20
                     visible: !root.isExporting
                     Btn { label: root.exportedUrl !== "" ? "Done" : "Cancel"; onTap: root.showExportModal = false }
-                    Btn { label: "Retry"; on: true; visible: root.exportedUrl === ""; onTap: root.startExport() }
+                    Btn { label: "Retry"; on: true; visible: root.exportFormat && root.exportedUrl === ""; onTap: root.startExport(root.exportFormat) }
                 }
             }
         }
@@ -1023,9 +1525,16 @@ Rectangle {
     // ---------------------------------------------------------------
     // EXPORT PIPELINE
     // ---------------------------------------------------------------
-    function startExport() {
+    function chooseExport() {
         isPlaying = false;
+        exportFormat = "";
+        exportedUrl = "";
+        statusMessage = "GIF plays anywhere; SVG and PDF keep the lines sharp (PDF: a page per frame). Planning ink is left out.";
         showExportModal = true;
+    }
+
+    function startExport(format) {
+        exportFormat = format || "gif";
         isExporting = true;
         exportedUrl = "";
         statusMessage = "Rendering " + frameCount + " frames...";
@@ -1042,15 +1551,25 @@ Rectangle {
 
     function runExportPipeline() {
         var W = 480, k = W / stage.width, H = Math.round(stage.height * k);
-        var strokes = [];
-        for (var f = 0; f < frames.length; f++) strokes.push(frames[f].strokes);
-        exportWorker.sendMessage({ frames: strokes, W: W, H: H, k: k, fps: fps });
+        var frames = [];
+        for (var f = 0; f < frameCount; f++) {
+            var shown = [];
+            for (var l = layers.length - 1; l >= 0; l--) { // bottom layer first
+                var d = layers[l].visible ? drawingAt(l, f) : null;
+                if (d) shown.push({ name: layers[l].name, strokes: d.strokes.filter(s => !isPlanning(s)) }); // finished ink only
+            }
+            frames.push(shown);
+        }
+        exportWorker.sendMessage({ format: exportFormat, frames: frames, W: W, H: H, k: k,
+                                   stageW: Math.round(stage.width), stageH: Math.round(stage.height), fps: fps });
     }
 
     // Where Export uploads: catbox.moe by default (anonymous, no key). A tablet can override it
-    // in <storageDir>/settings.json: { "upload": { "url": "...", "field": "...", "params": {} } }
-    property var uploader: ({ url: "https://catbox.moe/user/api.php", field: "fileToUpload",
-                              params: { reqtype: "fileupload" } })
+    // in <storageDir>/settings.json: { "upload": { "url": "...", "field": "...", "params": {} } }.
+    // Kept as JSON text and parsed per upload: the tablet's Qt can lose objects nested in a QML
+    // property, which dropped catbox's reqtype field (it answered HTTP 412)
+    property string uploaderJson: JSON.stringify({ url: "https://catbox.moe/user/api.php", field: "fileToUpload",
+                                                   params: { reqtype: "fileupload" } })
 
     function loadSettings() {
         var xhr = new XMLHttpRequest();
@@ -1058,7 +1577,7 @@ Rectangle {
             if (xhr.readyState !== XMLHttpRequest.DONE || !xhr.responseText) return;
             try {
                 var u = JSON.parse(xhr.responseText).upload;
-                if (u && u.url) root.uploader = { url: u.url, field: u.field || "file", params: u.params || {} };
+                if (u && u.url) root.uploaderJson = JSON.stringify({ url: u.url, field: u.field || "file", params: u.params || {} });
             } catch (e) {
                 console.log("[Animator] ignoring unreadable settings.json:", e);
             }
@@ -1067,21 +1586,23 @@ Rectangle {
         xhr.send();
     }
 
-    function upload(gifBytes) {
-        statusMessage = "Uploading GIF...";
+    function upload(fileBytes) {
+        if (shareWifi) return shareOnWifi(fileBytes);
+        var format = exportFormats[exportFormat], uploader = JSON.parse(uploaderJson);
+        statusMessage = "Uploading " + format.label + "...";
         var boundary = "----AnimatorBoundary" + Math.random().toString(36).substring(2);
         var head = "";
         for (var key in uploader.params)
             head += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"" + key + "\"\r\n\r\n" +
                     uploader.params[key] + "\r\n";
         head += "--" + boundary + "\r\n" +
-                "Content-Disposition: form-data; name=\"" + uploader.field + "\"; filename=\"flipbook.gif\"\r\n" +
-                "Content-Type: image/gif\r\n\r\n";
+                "Content-Disposition: form-data; name=\"" + uploader.field + "\"; filename=\"" + format.file + "\"\r\n" +
+                "Content-Type: " + format.type + "\r\n\r\n";
         var foot = "\r\n--" + boundary + "--\r\n";
-        var payload = new Uint8Array(head.length + gifBytes.length + foot.length);
+        var payload = new Uint8Array(head.length + fileBytes.length + foot.length);
         for (var h = 0; h < head.length; h++) payload[h] = head.charCodeAt(h);
-        payload.set(gifBytes, head.length);
-        for (var b = 0; b < foot.length; b++) payload[head.length + gifBytes.length + b] = foot.charCodeAt(b);
+        payload.set(fileBytes, head.length);
+        for (var b = 0; b < foot.length; b++) payload[head.length + fileBytes.length + b] = foot.charCodeAt(b);
 
         var xhr = new XMLHttpRequest();
         xhr.open("POST", uploader.url);
@@ -1090,7 +1611,15 @@ Rectangle {
             if (xhr.readyState !== XMLHttpRequest.DONE) return;
             root.isExporting = false;
             if (xhr.status !== 200 && xhr.status !== 201) {
-                root.statusMessage = xhr.status ? "Upload error (HTTP " + xhr.status + ")" : "Network error: couldn't reach the upload server";
+                // Name the server and quote its reply: a refusal from the tablet (e.g. 412) is otherwise a mystery
+                var host = uploader.url.split("/")[2];
+                console.log("[Animator] upload to", uploader.url, "failed: HTTP", xhr.status, "
+" +
+                            xhr.getAllResponseHeaders() + "
+" + xhr.responseText.slice(0, 2000));
+                root.statusMessage = xhr.status ? "Upload error (HTTP " + xhr.status + " from " + host + "): " +
+                                                  xhr.responseText.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160)
+                                                : "Network error: couldn't reach " + host;
                 return;
             }
             var match = xhr.responseText.match(/https?:\/\/[^\s'"\\,}]+/);
@@ -1101,5 +1630,36 @@ Rectangle {
             qrCanvas.requestPaint();
         };
         xhr.send(payload.buffer);
+    }
+
+    // Wi-Fi share: QML can't listen on a socket, so the pen backend serves the file
+    // (backend/share.c). Write it where the backend can read it, then ask for the link.
+    function shareOnWifi(fileBytes) {
+        var format = exportFormats[exportFormat], file = storageDir + "/" + format.file;
+        statusMessage = "Starting the Wi-Fi share...";
+        var xhr = new XMLHttpRequest();
+        xhr.open("PUT", file);
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return;
+            penBackend.sendMessage(2, format.type + " " + decodeURIComponent(file.replace(/^file:\/\//, "")));
+            shareTimeout.start();
+        };
+        xhr.send(new Uint8Array(fileBytes).buffer);
+    }
+
+    function wifiShared(reply) {
+        shareTimeout.stop();
+        isExporting = false;
+        var ok = reply.indexOf("http") === 0;
+        exportedUrl = ok ? reply : "";
+        statusMessage = ok ? "On the same Wi-Fi, scan with your phone. The link works for 10 minutes while Animator stays open:"
+                           : reply; // SHARE_TIMEOUT_MS in backend/share.h
+        qrCanvas.requestPaint();
+    }
+
+    Timer {
+        id: shareTimeout
+        interval: 5000
+        onTriggered: { root.isExporting = false; root.statusMessage = "The tablet's share server didn't answer"; }
     }
 }
