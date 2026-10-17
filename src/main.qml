@@ -671,6 +671,7 @@ Rectangle {
             }
         }
         TapHandler {
+            acceptedDevices: PointerDevice.Mouse // the pen only: palms and fingers are touch
             gesturePolicy: TapHandler.ReleaseWithinBounds
             onTapped: btn.tap()
         }
@@ -769,7 +770,7 @@ Rectangle {
             text: root.projectName
             font.pixelSize: 24; font.bold: true
             elide: Text.ElideRight
-            TapHandler { onTapped: root.startRename() }
+            TapHandler { acceptedDevices: PointerDevice.Mouse; onTapped: root.startRename() }
         }
         Row {
             id: rightGroup
@@ -888,7 +889,7 @@ Rectangle {
             property int dragFrom: -1
             property int dragTo: -1
             property int scrollSlop: 24 // px the pen may wander during a hold before it scrolls instead
-            interactive: dragFrom < 0
+            interactive: false // the pen scrolls it below; a palm mustn't
 
             delegate: Rectangle {
                 y: 6
@@ -912,6 +913,7 @@ Rectangle {
                     property real pressContentX
                     property bool scrolling: false
                     onPressed: (m) => {
+                        if (m.source !== Qt.MouseEventNotSynthesized) { m.accepted = false; return; } // palm
                         pressX = mapToItem(strip, m.x, 0).x;
                         pressContentX = strip.contentX;
                         scrolling = false;
@@ -1077,7 +1079,7 @@ Rectangle {
                     }
                 }
                 Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: "#aaaaaa" }
-                TapHandler { onTapped: root.openProject(modelData.id) }
+                TapHandler { acceptedDevices: PointerDevice.Mouse; onTapped: root.openProject(modelData.id) }
             }
         }
     }
