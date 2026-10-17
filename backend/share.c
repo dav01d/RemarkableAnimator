@@ -1,6 +1,6 @@
 // Wi-Fi share: serves one exported file over HTTP, so a phone on the same Wi-Fi can fetch it
 // without a cloud upload. It runs inside the pen backend's poll loop, so nothing here blocks:
-// every socket is non-blocking and each wake-up does at most one recv or send per client.
+// every socket is non-blocking and each wake-up does at most one small recv or send per client.
 // Only GET/HEAD of the shared file's name is answered; anything else gets a 404.
 
 #include "share.h"
@@ -19,6 +19,7 @@
 
 #define MAX_FILE_BYTES (64 << 20)
 #define CLIENT_TIMEOUT_MS 15000 // drop a phone that stops talking, to free its slot
+#define SEND_CHUNK (64 << 10)   // per send, so one wake-up never copies much (the pen waits)
 
 struct client {
     int fd;                     // -1: free slot
@@ -163,7 +164,7 @@ static void serve(struct client *c, short revents, long now) {
     }
     const char *out = c->sent < c->head_len ? c->head + c->sent : file + (c->sent - c->head_len);
     size_t left = c->sent < c->head_len ? c->head_len - c->sent : c->head_len + c->body_len - c->sent;
-    ssize_t n = send(c->fd, out, left, MSG_NOSIGNAL);
+    ssize_t n = send(c->fd, out, left < SEND_CHUNK ? left : SEND_CHUNK, MSG_NOSIGNAL);
     if (n < 0) { if (errno != EAGAIN && errno != EWOULDBLOCK) drop(c); return; }
     c->sent += n;
     c->seen = now;

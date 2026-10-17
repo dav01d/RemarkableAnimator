@@ -9,6 +9,8 @@ back on the tablet, and share them as a GIF via QR code.
 - Undo/redo, rename, a Projects screen; everything autosaves on the tablet (works offline)
 - Export the current animation as a GIF, uploaded to [catbox.moe](https://catbox.moe) and
   shared via a QR code (only when you tap Export)
+- Or share it over Wi-Fi with no cloud: the tablet serves the file itself for 10 minutes, and the
+  QR code points at it (your phone must be on the same network)
 
 ## What you need
 - A reMarkable Paper Pro Move on software version 3.28
@@ -83,8 +85,8 @@ The response may be plain text containing the link, or JSON with a `url` field.
 
 ## Build
 ```powershell
-# Pen pressure backend: static aarch64 binary via zig (pip install ziglang)
-python -m ziglang cc -target aarch64-linux-musl -O2 -static -s -o src/backend/entry backend/pen.c
+# Backend (pen pressure, Wi-Fi share): static aarch64 binary via zig (winget install zig.zig)
+zig cc -target aarch64-linux-musl -O2 -static -s -o src/backend/entry backend/pen.c backend/share.c
 # QML resources, with PySide6's rcc
 rcc --binary src/resources.qrc -o src/resources.rcc
 # Close the app on the tablet, then copy and restart xochitl (AppLoad caches the app until then)

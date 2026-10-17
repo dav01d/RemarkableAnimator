@@ -3,7 +3,7 @@
 AppLoad app for the reMarkable Paper Pro Move. Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 first: the tablet's renderer and input behave unlike desktop Qt, and most bugs come from that.
 
-- **Build**: `src/backend/entry` from `backend/pen.c` (zig cc, aarch64-linux-musl, static) and
+- **Build**: `src/backend/entry` from `backend/pen.c` + `share.c` (zig cc, aarch64-linux-musl, static) and
   `src/resources.rcc` from `src/resources.qrc` (rcc --binary). Rebuild both before deploying.
 - **Deploy**: AppLoad caches the app until xochitl restarts, so reopening it runs the old code.
   Close the app, then `deploy.ps1 -Restart`. Don't restart xochitl while the app is open (it can
