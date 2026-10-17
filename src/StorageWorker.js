@@ -3,7 +3,8 @@
 // Files: <dir>/index.json = [{ id, name, updated, frames }], <dir>/<id>.json = project.
 // Strokes are stored compactly: { t: tool, c: color, p: [x, y, w, x, y, w, ...] }.
 //
-// Messages in:  { op: "list", dir } | { op: "load", dir, id } | { op: "save", dir, project }
+// Messages in:  { op: "list", dir } | { op: "load", dir, id }
+//               | { op: "save", dir, project: { id, name, fps, order: [key], changed: { key: strokes } } }
 // Messages out: { op: "list", index } | { op: "loaded", project } | { op: "saved", index }
 //               | { op: "error", message }
 
@@ -26,15 +27,16 @@ function readIndex(dir, done) {
 
 function round1(v) { return Math.round(v * 10) / 10; }
 
-function pack(frames) {
-    return frames.map(function(strokes) {
-        return strokes.map(function(s) {
-            var p = [];
-            for (var i = 0; i < s.pts.length; i++) p.push(round1(s.pts[i].x), round1(s.pts[i].y), round1(s.pts[i].w));
-            return { t: s.tool, c: s.color, p: p };
-        });
+function pack(strokes) {
+    return strokes.map(function(s) {
+        var p = [];
+        for (var i = 0; i < s.pts.length; i++) p.push(round1(s.pts[i].x), round1(s.pts[i].y), round1(s.pts[i].w));
+        return { t: s.tool, c: s.color, p: p };
     });
 }
+
+// The UI sends only frames edited since its last save; the rest come from here, packed
+var saved = { id: "", frames: {} }; // frames by key
 
 function unpack(frames) {
     return frames.map(function(strokes) {
@@ -60,13 +62,21 @@ WorkerScript.onMessage = function(msg) {
             }
         });
     } else if (msg.op === "save") {
-        var p = msg.project;
-        var body = JSON.stringify({ id: p.id, name: p.name, fps: p.fps, frames: pack(p.frames) });
+        var p = msg.project, frames = [], kept = {};
+        if (saved.id !== p.id) saved = { id: p.id, frames: {} };
+        for (var key in p.changed) saved.frames[key] = pack(p.changed[key]);
+        for (var i = 0; i < p.order.length; i++) {
+            var f = saved.frames[p.order[i]];
+            if (!f) { WorkerScript.sendMessage({ op: "error", message: "Couldn't save" }); return; }
+            frames.push(kept[p.order[i]] = f);
+        }
+        saved.frames = kept; // forget deleted frames
+        var body = JSON.stringify({ id: p.id, name: p.name, fps: p.fps, frames: frames });
         request("PUT", msg.dir + "/" + p.id + ".json", body, function(ok) {
             if (ok === null) { WorkerScript.sendMessage({ op: "error", message: "Couldn't save" }); return; }
             readIndex(msg.dir, function(index) {
                 index = index.filter(function(e) { return e.id !== p.id; });
-                index.unshift({ id: p.id, name: p.name, updated: Date.now(), frames: p.frames.length });
+                index.unshift({ id: p.id, name: p.name, updated: Date.now(), frames: frames.length });
                 request("PUT", msg.dir + "/index.json", JSON.stringify(index), function() {
                     WorkerScript.sendMessage({ op: "saved", index: index });
                 });
