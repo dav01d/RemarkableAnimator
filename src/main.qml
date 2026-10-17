@@ -6,8 +6,8 @@ import "QrCode.js" as QrCodeLib
 
 // Rendering note: xochitl's e-paper scene graph (libqsgepaper) only draws rectangles,
 // images, text and painted items; QtQuick.Shapes renders nothing there. So the live
-// stroke is drawn as small rotated Rectangles (tiny e-ink updates, low latency) and on
-// pen-up it is baked into the frame's Canvas image and the Rectangles are destroyed.
+// stroke is drawn into small Canvas tiles under the pen (tiny e-ink updates) and on
+// pen-up it is baked into the frame's Canvas image and the tiles are destroyed.
 Rectangle {
     id: root
     anchors.fill: parent
@@ -59,7 +59,8 @@ Rectangle {
     }
 
     // Live gesture
-    property var live: null             // stroke being drawn, plus items: [Rectangle]
+    property var live: null             // stroke being drawn, plus tiles: { "col,row": { canvas, segs } }
+    property int liveTile: 128          // px: size of the Canvas tiles the live stroke is drawn into
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
     property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
@@ -222,10 +223,15 @@ Rectangle {
         }
     }
 
-    // One live stroke segment: a rounded bar from point a to point b
+    // One tile of the live stroke
     Component {
-        id: segComp
-        Rectangle { antialiasing: true }
+        id: tileComp
+        Canvas {
+            width: root.liveTile; height: root.liveTile
+            renderTarget: Canvas.Image
+            renderStrategy: Canvas.Immediate
+            onPaint: root.paintTile(this)
+        }
     }
 
     // ---------------------------------------------------------------
@@ -410,18 +416,40 @@ Rectangle {
         ctx.globalCompositeOperation = "source-over";
     }
 
-    // The e-paper renderer doesn't draw rotated Rectangles, so the live line is a chain of
-    // unrotated round dots, close enough to overlap into a solid line
+    // The live line goes into Canvas tiles created under the pen as it moves: a handful of
+    // items however long the stroke, so nothing is baked until pen-up, and each move
+    // repaints only the small area it touches
     function addSegment(s, a, b) {
-        var len = Math.hypot(b.x - a.x, b.y - a.y);
-        var n = Math.max(1, Math.ceil(len / Math.max(1, Math.min(a.w, b.w) * 0.35)));
-        for (var k = 1; k <= n; k++) {
-            var t = k / n, w = a.w + (b.w - a.w) * t;
-            s.items.push(segComp.createObject(liveLayer, {
-                x: a.x + (b.x - a.x) * t - w / 2, y: a.y + (b.y - a.y) * t - w / 2,
-                width: w, height: w, radius: w / 2, color: s.color
-            }));
+        var r = Math.max(a.w, b.w) / 2 + 1, T = liveTile;
+        var x0 = Math.min(a.x, b.x) - r, y0 = Math.min(a.y, b.y) - r;
+        var x1 = Math.max(a.x, b.x) + r, y1 = Math.max(a.y, b.y) + r;
+        for (var col = Math.floor(x0 / T); col <= Math.floor(x1 / T); col++) {
+            for (var row = Math.floor(y0 / T); row <= Math.floor(y1 / T); row++) {
+                var key = col + "," + row, t = s.tiles[key];
+                if (!t) t = s.tiles[key] = { canvas: tileComp.createObject(liveLayer, { x: col * T, y: row * T }), segs: [] };
+                t.segs.push([a, b]);
+                t.canvas.markDirty(Qt.rect(x0 - col * T, y0 - row * T, x1 - x0, y1 - y0));
+            }
         }
+    }
+
+    function paintTile(c) {
+        var t = null, ctx = c.getContext("2d");
+        if (live) for (var k in live.tiles) if (live.tiles[k].canvas === c) t = live.tiles[k];
+        if (!t || !ctx) return; // after pen-up the frame image has the ink
+        ctx.strokeStyle = live.color;
+        ctx.fillStyle = live.color;
+        ctx.lineCap = "round";
+        for (var i = 0; i < t.segs.length; i++) {
+            var a = t.segs[i][0], b = t.segs[i][1];
+            ctx.beginPath();
+            if (a === b) { ctx.arc(a.x - c.x, a.y - c.y, a.w / 2, 0, 2 * Math.PI); ctx.fill(); continue; }
+            ctx.lineWidth = b.w;
+            ctx.moveTo(a.x - c.x, a.y - c.y);
+            ctx.lineTo(b.x - c.x, b.y - c.y);
+            ctx.stroke();
+        }
+        t.segs = [];
     }
 
     // ---------------------------------------------------------------
@@ -528,7 +556,7 @@ Rectangle {
             return;
         }
         var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
-        live = { tool: "pen", color: inkColor, pts: [p], items: [], baked: 0 };
+        live = { tool: "pen", color: inkColor, pts: [p], tiles: {} };
         addSegment(live, p, p);
     }
 
@@ -556,17 +584,6 @@ Rectangle {
         var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
         live.pts.push(p);
         addSegment(live, last, p);
-        if (live.items.length >= 400) bakeLive();
-    }
-
-    // Long strokes would pile up thousands of preview items and stall xochitl (its watchdog
-    // reboots the tablet after a minute), so bake what's drawn so far into the frame image
-    function bakeLive() {
-        var f = frame;
-        f.trash = f.trash.concat(live.items);
-        queueStroke(f, { tool: live.tool, color: live.color, pts: live.pts.slice(live.baked) });
-        live.items = [];
-        live.baked = live.pts.length - 1; // next chunk starts at the last baked point
     }
 
     function endGesture() {
@@ -575,10 +592,10 @@ Rectangle {
         if (live) {
             var f = frame, s = { tool: live.tool, color: live.color, pts: live.pts };
             f.strokes.push(s);
-            f.trash = f.trash.concat(live.items);
-            queueStroke(f, { tool: s.tool, color: s.color, pts: s.pts.slice(live.baked) });
+            for (var k in live.tiles) f.trash.push(live.tiles[k].canvas);
+            queueStroke(f, s);
             pushOp({ t: "add", s: s });
-            console.log("[Animator][perf] stroke", s.pts.length, "pts,", live.ev || 0, "moves,",
+            console.log("[Animator][perf] stroke", s.pts.length, "pts,", Object.keys(live.tiles).length, "tiles,", live.ev || 0, "moves,",
                         live.ms || 0, "ms JS (", ((live.ms || 0) / Math.max(1, live.ev || 0)).toFixed(1), "ms/move ),",
                         live.frames || 0, "frames, move->frame avg", ((live.lat || 0) / Math.max(1, live.frames || 0)).toFixed(0),
                         "ms max", live.latMax || 0, "ms");
