@@ -171,7 +171,9 @@ Rectangle {
     function newProject() {
         saveProject();
         projectId = "anim-" + Date.now();
-        projectName = "Animation " + (projectIndex.length + 1);
+        var n = projectIndex.length + 1; // the next number no animation has (some may be deleted)
+        while (projectIndex.some(e => e.name === "Animation " + n)) n++;
+        projectName = "Animation " + n;
         resetLayers(blankLayers());
         showProjects = false;
         saveProject();
@@ -189,19 +191,36 @@ Rectangle {
 
     property bool showRename: false
     property string renameText: ""
+    property int renameLayer: -1        // the layer being renamed, or -1 for the animation
+    readonly property int renameMax: renameLayer < 0 ? 32 : 10 // a layer name fits its header
+    property bool kbShift: false        // the next letter is upper case (on again after a space)
+    property bool kbNumbers: false      // the keyboard shows digits and symbols
 
-    function startRename() { renameText = projectName; showRename = true; }
+    function startRename(l) {
+        renameLayer = l === undefined ? -1 : l;
+        renameText = renameLayer < 0 ? projectName : layers[l].name;
+        kbShift = false;
+        kbNumbers = false;
+        showRename = true;
+    }
 
     function typeKey(k) {
-        if (renameText.length >= 32) return;
-        var capital = renameText.length === 0 || renameText[renameText.length - 1] === " ";
-        renameText += capital ? k.toUpperCase() : k;
+        if (renameText.length >= renameMax) return;
+        renameText += kbShift ? k.toUpperCase() : k;
+        kbShift = k === " ";
     }
 
     function finishRename() {
         var name = renameText.trim();
-        if (name) { projectName = name; saveProject(); }
+        if (name && renameLayer < 0) { projectName = name; saveProject(); }
+        else if (name) { layers[renameLayer].name = name; historyRev++; } // autosave
         showRename = false;
+    }
+
+    // The list reply then opens the most recent one left (or a new one)
+    function deleteProject(id) {
+        if (id === projectId) { saveTimer.stop(); projectId = ""; }
+        storage.sendMessage({ op: "delete", dir: storageDir, id: id });
     }
 
     function openProject(id) {
@@ -735,6 +754,7 @@ Rectangle {
         property bool on: false
         property bool flat: false       // toolbar style: no outline, solid black when on
         property bool enabledLook: true
+        property int fontSize: 21
         readonly property color ink: on ? "white" : (enabledLook ? "black" : "#aaaaaa")
         signal tap
         signal hold
@@ -758,7 +778,7 @@ Rectangle {
                 visible: btn.label !== ""
                 anchors.verticalCenter: parent.verticalCenter
                 text: btn.label
-                font.pixelSize: 21
+                font.pixelSize: btn.fontSize
                 font.bold: true
                 color: btn.ink
             }
@@ -818,6 +838,12 @@ Rectangle {
                 c.moveTo(23, 18); c.arc(18, 18, 5, 0, 2 * Math.PI); break;
             case "hold": // a drawing held along the timeline
                 c.rect(4, 11, 14, 14); c.moveTo(18, 18); c.lineTo(32, 18); break;
+            case "shift": // an outlined arrow up
+                c.moveTo(18, 5); c.lineTo(31, 18); c.lineTo(24, 18); c.lineTo(24, 30); c.lineTo(12, 30);
+                c.lineTo(12, 18); c.lineTo(5, 18); c.closePath(); break;
+            case "backspace":
+                c.moveTo(4, 18); c.lineTo(12, 8); c.lineTo(32, 8); c.lineTo(32, 28); c.lineTo(12, 28); c.closePath();
+                c.moveTo(17, 13); c.lineTo(26, 23); c.moveTo(26, 13); c.lineTo(17, 23); break;
             case "close": c.moveTo(9, 9); c.lineTo(27, 27); c.moveTo(27, 9); c.lineTo(9, 27); break;
             case "projects": c.rect(6, 6, 10, 10); c.rect(20, 6, 10, 10); c.rect(6, 20, 10, 10); c.rect(20, 20, 10, 10); break;
             case "share": // arrow up out of a tray
@@ -973,7 +999,7 @@ Rectangle {
         Row {
             width: parent.width
 
-            // One header per layer: tap to draw on it, hold to delete it; the eye hides it
+            // One header per layer: tap to draw on it (again to rename it), hold to delete it; the eye hides it
             Column {
                 id: layerHeads
                 topPadding: 6; leftPadding: 8
@@ -985,11 +1011,12 @@ Rectangle {
                         Btn {
                             id: layerBtn
                             property bool armed: false
-                            width: 106; height: 52
+                            width: 130; height: 52
                             label: armed ? "Delete?" : root.historyRev >= 0 && root.layers[index] ? root.layers[index].name : ""
                             on: index === root.currentLayer || armed
                             onTap: {
                                 if (armed) { armed = false; root.deleteLayer(index); }
+                                else if (index === root.currentLayer) root.startRename(index);
                                 else root.currentLayer = index;
                             }
                             onHold: if (root.layerCount > 1) { armed = true; disarmLayer.restart(); }
@@ -1004,7 +1031,7 @@ Rectangle {
                 }
                 Btn {
                     visible: root.layerCount < root.maxLayers
-                    width: 152; height: 40
+                    width: 176; height: 40
                     label: "+ Layer"
                     onTap: root.addLayer()
                 }
@@ -1179,11 +1206,19 @@ Rectangle {
         MouseArea { anchors.fill: parent }
 
         Column {
-            anchors.centerIn: parent
+            x: 16; y: 16
             width: parent.width - 32
             spacing: 14
 
-            Text { text: "Rename animation"; font.pixelSize: 28; font.bold: true }
+            Item {
+                width: parent.width; height: 58
+                Btn { label: "Cancel"; flat: true; onTap: root.showRename = false }
+                Text {
+                    anchors.centerIn: parent
+                    text: root.renameLayer < 0 ? "Rename animation" : "Rename layer"
+                    font.pixelSize: 28; font.bold: true
+                }
+            }
             Rectangle {
                 width: parent.width; height: 80
                 border.color: "black"; border.width: 3; radius: 8
@@ -1195,28 +1230,58 @@ Rectangle {
                     elide: Text.ElideLeft
                 }
             }
-            Repeater {
-                model: ["1234567890", "qwertyuiop", "asdfghjkl", "zxcvbnm"]
-                Row {
-                    anchors.horizontalCenter: parent.horizontalCenter
-                    spacing: 6
-                    Repeater {
-                        model: modelData.split("")
+        }
+
+        // Docked at the bottom like reMarkable's: white keys on grey, lower case unless Shift
+        Rectangle {
+            anchors.bottom: parent.bottom
+            width: parent.width
+            height: keys.height + 24
+            color: "#e0e0e0"
+            Column {
+                id: keys
+                x: 12; y: 12
+                width: parent.width - 24
+                spacing: 8
+                readonly property real keyW: (width - 9 * 8) / 10
+                Repeater {
+                    model: root.kbNumbers ? ["1234567890", "-/:;()&@'#", ".,?!"] : ["qwertyuiop", "asdfghjkl", "zxcvbnm"]
+                    Row {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        spacing: 8
                         Btn {
-                            width: (root.width - 32 - 9 * 6) / 10; height: 72
-                            label: modelData.toUpperCase()
-                            onTap: root.typeKey(modelData)
+                            visible: index === 2 && !root.kbNumbers
+                            icon: "shift"; flat: true; on: root.kbShift
+                            width: keys.keyW * 1.5; height: 80
+                            onTap: root.kbShift = !root.kbShift
+                        }
+                        Repeater {
+                            model: modelData.split("")
+                            Btn {
+                                flat: true
+                                width: keys.keyW; height: 80; fontSize: 28
+                                label: root.kbShift ? modelData.toUpperCase() : modelData
+                                onTap: root.typeKey(modelData)
+                            }
+                        }
+                        Btn {
+                            visible: index === 2
+                            icon: "backspace"; flat: true
+                            width: keys.keyW * 1.5; height: 80
+                            onTap: root.renameText = root.renameText.slice(0, -1)
                         }
                     }
                 }
-            }
-            Row {
-                anchors.horizontalCenter: parent.horizontalCenter
-                spacing: 6
-                Btn { label: "Cancel"; height: 72; onTap: root.showRename = false }
-                Btn { label: "Space"; height: 72; width: 240; onTap: root.typeKey(" ") }
-                Btn { label: "Delete"; height: 72; onTap: root.renameText = root.renameText.slice(0, -1) }
-                Btn { label: "Save"; height: 72; on: true; onTap: root.finishRename() }
+                Row {
+                    spacing: 8
+                    Btn {
+                        label: root.kbNumbers ? "abc" : "123"; flat: true
+                        width: keys.keyW * 1.5; height: 80
+                        onTap: root.kbNumbers = !root.kbNumbers
+                    }
+                    Btn { flat: true; width: keys.width - 3 * keys.keyW - 16; height: 80; onTap: root.typeKey(" ") }
+                    Btn { label: "Done"; on: true; width: keys.keyW * 1.5; height: 80; onTap: root.finishRename() }
+                }
             }
         }
     }
@@ -1235,7 +1300,7 @@ Rectangle {
             id: projHeader
             width: parent.width
             Bar {
-                Btn { label: "Close"; onTap: root.showProjects = false }
+                Btn { icon: "close"; flat: true; onTap: root.showProjects = false }
                 Btn { label: "+ New animation"; on: true; onTap: root.newProject() }
                 Text {
                     height: 58; verticalAlignment: Text.AlignVCenter
@@ -1252,6 +1317,8 @@ Rectangle {
             clip: true
             model: root.projectIndex
             delegate: Rectangle {
+                id: projRow
+                property bool armed: false
                 width: ListView.view.width
                 height: 96
                 color: modelData.id === root.projectId ? "#e6e6e6" : "white"
@@ -1267,7 +1334,22 @@ Rectangle {
                     }
                 }
                 Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: "#aaaaaa" }
-                TapHandler { acceptedDevices: PointerDevice.Mouse; onTapped: root.openProject(modelData.id) }
+                Item { // tap the row to open it; the trash keeps its own taps
+                    width: trash.x; height: parent.height
+                    TapHandler { acceptedDevices: PointerDevice.Mouse; onTapped: root.openProject(modelData.id) }
+                }
+                Btn {
+                    id: trash
+                    anchors.right: parent.right; anchors.rightMargin: 16
+                    anchors.verticalCenter: parent.verticalCenter
+                    icon: "delete"; label: projRow.armed ? "Delete?" : ""
+                    flat: true; on: projRow.armed
+                    onTap: {
+                        if (projRow.armed) root.deleteProject(modelData.id);
+                        else { projRow.armed = true; disarmRow.restart(); }
+                    }
+                    Timer { id: disarmRow; interval: 3000; onTriggered: projRow.armed = false }
+                }
             }
         }
     }
