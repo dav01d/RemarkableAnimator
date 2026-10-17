@@ -626,22 +626,36 @@ Rectangle {
     component Btn: Rectangle {
         id: btn
         property string label
+        property string icon            // an Icon name, shown before the label
         property bool on: false
+        property bool flat: false       // toolbar style: no outline, solid black when on
         property bool enabledLook: true
+        readonly property color ink: on ? "white" : (enabledLook ? "black" : "#aaaaaa")
         signal tap
-        width: Math.max(60, txt.implicitWidth + 26)
+        width: Math.max(60, content.implicitWidth + 26)
         height: 58
         radius: 8
         color: on ? "black" : "white"
         border.color: "black"
-        border.width: 2
-        Text {
-            id: txt
+        border.width: flat ? 0 : 2
+        Row {
+            id: content
             anchors.centerIn: parent
-            text: btn.label
-            font.pixelSize: 21
-            font.bold: true
-            color: btn.on ? "white" : (btn.enabledLook ? "black" : "#aaaaaa")
+            spacing: 6
+            Loader {
+                active: btn.icon !== ""
+                visible: active
+                anchors.verticalCenter: parent.verticalCenter
+                sourceComponent: Icon { name: btn.icon; ink: btn.ink }
+            }
+            Text {
+                visible: btn.label !== ""
+                anchors.verticalCenter: parent.verticalCenter
+                text: btn.label
+                font.pixelSize: 21
+                font.bold: true
+                color: btn.ink
+            }
         }
         TapHandler {
             gesturePolicy: TapHandler.ReleaseWithinBounds
@@ -666,27 +680,49 @@ Rectangle {
     // ---------------------------------------------------------------
     // TOP: app actions + tools
     // ---------------------------------------------------------------
-    // Undo arrow drawn on a Canvas (the tablet font may lack arrow glyphs); mirrored = redo
-    component ArrowIcon: Canvas {
-        property bool mirrored: false
+    // Thin outline icons drawn on a Canvas (the tablet font may lack the glyphs, and its scene
+    // graph only draws rectangles, images, text and painted items)
+    component Icon: Canvas {
+        property string name
         property color ink: "black"
         width: 36; height: 36
         onInkChanged: requestPaint()
+        onNameChanged: requestPaint()
         onPaint: {
             var c = getContext("2d");
             c.reset();
-            if (mirrored) { c.translate(width, 0); c.scale(-1, 1); }
             c.strokeStyle = ink; c.fillStyle = ink;
-            c.lineWidth = 4; c.lineCap = "round"; c.lineJoin = "round";
+            c.lineWidth = 3; c.lineCap = "round"; c.lineJoin = "round";
             c.beginPath();
-            c.moveTo(12, 11); c.lineTo(22, 11);
-            c.arc(22, 19.5, 8.5, -Math.PI / 2, Math.PI / 2, false);
-            c.lineTo(11, 28);
+            switch (name) {
+            case "redo": c.translate(width, 0); c.scale(-1, 1); // then draw the undo arrow mirrored
+            case "undo":
+                c.moveTo(12, 11); c.lineTo(22, 11); c.arc(22, 19.5, 8.5, -Math.PI / 2, Math.PI / 2, false); c.lineTo(11, 28);
+                c.stroke();
+                c.beginPath(); c.moveTo(4, 11); c.lineTo(13, 4); c.lineTo(13, 18); c.closePath(); c.fill();
+                return;
+            case "close": c.moveTo(9, 9); c.lineTo(27, 27); c.moveTo(27, 9); c.lineTo(9, 27); break;
+            case "projects": c.rect(6, 6, 10, 10); c.rect(20, 6, 10, 10); c.rect(6, 20, 10, 10); c.rect(20, 20, 10, 10); break;
+            case "share": // arrow up out of a tray
+                c.moveTo(18, 22); c.lineTo(18, 5); c.moveTo(11, 12); c.lineTo(18, 5); c.lineTo(25, 12);
+                c.moveTo(11, 16); c.lineTo(6, 16); c.lineTo(6, 31); c.lineTo(30, 31); c.lineTo(30, 16); c.lineTo(25, 16); break;
+            case "prev": c.moveTo(22, 8); c.lineTo(12, 18); c.lineTo(22, 28); break;
+            case "next": c.moveTo(14, 8); c.lineTo(24, 18); c.lineTo(14, 28); break;
+            case "play": c.moveTo(11, 7); c.lineTo(28, 18); c.lineTo(11, 29); c.closePath(); c.fill(); return;
+            case "stop": c.rect(10, 10, 16, 16); c.fill(); return;
+            case "new": c.rect(8, 5, 20, 26); c.moveTo(18, 12); c.lineTo(18, 24); c.moveTo(12, 18); c.lineTo(24, 18); break;
+            case "copy": c.rect(13, 11, 16, 21); c.moveTo(8, 26); c.lineTo(8, 5); c.lineTo(23, 5); break;
+            case "delete": // trash can
+                c.moveTo(6, 9); c.lineTo(30, 9); c.moveTo(14, 9); c.lineTo(14, 5); c.lineTo(22, 5); c.lineTo(22, 9);
+                c.moveTo(9, 9); c.lineTo(11, 31); c.lineTo(25, 31); c.lineTo(27, 9);
+                c.moveTo(15, 14); c.lineTo(15, 26); c.moveTo(21, 14); c.lineTo(21, 26); break;
+            case "onion": // the current frame over fainter earlier ones
+                c.arc(23, 18, 9, 0, 2 * Math.PI); c.stroke();
+                c.globalAlpha = 0.45; c.beginPath(); c.arc(16, 18, 9, Math.PI / 2, 3 * Math.PI / 2); c.stroke();
+                c.globalAlpha = 0.25; c.beginPath(); c.arc(9, 18, 7, Math.PI / 2, 3 * Math.PI / 2);
+                break;
+            }
             c.stroke();
-            c.beginPath();
-            c.moveTo(3, 11); c.lineTo(13, 3); c.lineTo(13, 19);
-            c.closePath();
-            c.fill();
         }
     }
 
@@ -702,8 +738,8 @@ Rectangle {
             id: leftGroup
             x: 8; y: 8
             spacing: 8
-            Btn { label: "Exit"; onTap: root.close() }
-            Btn { label: "Projects"; onTap: root.showProjects = true }
+            Btn { icon: "close"; flat: true; onTap: root.close() }
+            Btn { icon: "projects"; flat: true; onTap: root.showProjects = true }
         }
         Text {
             anchors.left: leftGroup.right; anchors.right: rightGroup.left
@@ -711,7 +747,7 @@ Rectangle {
             height: parent.height
             verticalAlignment: Text.AlignVCenter
             text: root.projectName
-            font.pixelSize: 24; font.bold: true; font.underline: true
+            font.pixelSize: 24; font.bold: true
             elide: Text.ElideRight
             TapHandler { onTapped: root.startRename() }
         }
@@ -724,6 +760,7 @@ Rectangle {
                 model: root.sizes.length
                 Btn {
                     on: root.sizeIndex === index
+                    flat: true
                     width: 58
                     onTap: root.sizeIndex = index
                     Rectangle {
@@ -733,26 +770,21 @@ Rectangle {
                     }
                 }
             }
+            Item { width: 12; height: 1 } // gap between groups
             Repeater {
                 model: ["#000000", "#808080"]
                 Btn {
+                    on: root.inkColor === modelData
+                    flat: true
                     width: 58
-                    border.width: root.inkColor === modelData ? 6 : 2
                     onTap: root.inkColor = modelData
-                    Rectangle { anchors.centerIn: parent; width: 30; height: 30; radius: 4; color: modelData }
+                    Rectangle { anchors.centerIn: parent; width: 30; height: 30; radius: 6; color: modelData; border.color: "white"; border.width: 2 }
                 }
             }
-            Btn {
-                width: 58
-                onTap: root.undo()
-                ArrowIcon { anchors.centerIn: parent; ink: root.canUndo ? "black" : "#aaaaaa" }
-            }
-            Btn {
-                width: 58
-                onTap: root.redo()
-                ArrowIcon { anchors.centerIn: parent; mirrored: true; ink: root.canRedo ? "black" : "#aaaaaa" }
-            }
-            Btn { label: "Export"; on: true; onTap: root.startExport() }
+            Item { width: 12; height: 1 } // gap between groups
+            Btn { icon: "undo"; flat: true; width: 58; enabledLook: root.canUndo; onTap: root.undo() }
+            Btn { icon: "redo"; flat: true; width: 58; enabledLook: root.canRedo; onTap: root.redo() }
+            Btn { icon: "share"; flat: true; width: 58; onTap: root.startExport() }
         }
         Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 2; color: "black" }
     }
@@ -888,15 +920,17 @@ Rectangle {
         }
 
         Bar {
-            Btn { label: "◀"; onTap: root.goTo(root.current - 1) }
-            Btn { label: root.isPlaying ? "Stop" : "Play"; on: root.isPlaying; onTap: root.isPlaying = !root.isPlaying }
-            Btn { label: "▶"; onTap: root.goTo(root.current + 1) }
-            Btn { label: "+ New"; onTap: root.insertFrame(root.current + 1, null) }
-            Btn { label: "+ Copy"; onTap: root.insertFrame(root.current + 1, root.frame) }
+            Btn { icon: "prev"; flat: true; onTap: root.goTo(root.current - 1) }
+            Btn { icon: root.isPlaying ? "stop" : "play"; flat: true; on: root.isPlaying; onTap: root.isPlaying = !root.isPlaying }
+            Btn { icon: "next"; flat: true; onTap: root.goTo(root.current + 1) }
+            Btn { icon: "new"; flat: true; onTap: root.insertFrame(root.current + 1, null) }
+            Btn { icon: "copy"; flat: true; onTap: root.insertFrame(root.current + 1, root.frame) }
             Btn {
                 id: delBtn
                 property bool armed: false
-                label: armed ? "Sure?" : "Delete"
+                icon: "delete"
+                label: armed ? "Sure?" : ""
+                flat: true
                 on: armed
                 onTap: {
                     if (armed) { armed = false; root.deleteFrame(); }
@@ -905,11 +939,14 @@ Rectangle {
                 Timer { id: disarm; interval: 3000; onTriggered: delBtn.armed = false }
             }
             Btn {
-                label: root.onionDepth ? "Onion: " + root.onionDepth : "Onion: Off"
+                icon: "onion"
+                label: root.onionDepth ? root.onionDepth : "Off"
+                flat: true
+                enabledLook: root.onionDepth > 0
                 onTap: root.onionDepth = (root.onionDepth + 1) % 4
             }
-            Btn { label: root.fps + " fps"; onTap: root.fpsIndex = (root.fpsIndex + 1) % root.fpsOptions.length }
-            Btn { label: "Clear frame"; onTap: root.clearFrame() }
+            Btn { label: root.fps + " fps"; flat: true; onTap: root.fpsIndex = (root.fpsIndex + 1) % root.fpsOptions.length }
+            Btn { label: "Clear"; flat: true; onTap: root.clearFrame() }
         }
     }
 
