@@ -2,7 +2,7 @@
 param (
     [string]$TargetIp = "10.11.99.1",   # USB address of every reMarkable; put your Wi-Fi IP in deploy.local.ps1
     [string]$FallbackIp = "10.11.99.1",
-    [switch]$Restart  # also restart xochitl (normally unneeded: AppLoad reloads the app on launch)
+    [switch]$Restart  # also restart xochitl, which is what loads the new code (close the app first)
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,11 +64,11 @@ scp -o StrictHostKeyChecking=no -r "$srcDir/*" "root@${ip}:${remoteAppDir}/"
 Write-Host "Setting executable permissions..."
 ssh -o StrictHostKeyChecking=no root@$ip "chmod +x $remoteAppDir/backend/entry 2>/dev/null || true"
 
-# AppLoad loads the app fresh on every launch, so copying is enough. -Restart reloads xochitl
-# (e.g. a new app's first install); if a reboot wiped XOVI's tmpfs hook, xovi/start reinstalls
-# it. Restarting xochitl while the app is open can crash it, hence opt-in.
+# AppLoad caches the app's resources.rcc until xochitl restarts, so reopening the app still runs
+# the old code. -Restart reloads xochitl; if a reboot wiped XOVI's tmpfs hook, xovi/start
+# reinstalls it. Restarting xochitl while the app is open can crash it, hence opt-in.
 if (-not $Restart) {
-    Write-Host "Copied. Exit and reopen the app on the tablet to load it." -ForegroundColor Green
+    Write-Host "Copied. Close the app on the tablet, then run .\deploy.ps1 -Restart to load it." -ForegroundColor Green
     exit 0
 }
 Write-Host "Reloading the tablet UI..."
