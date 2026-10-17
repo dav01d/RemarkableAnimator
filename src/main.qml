@@ -791,6 +791,7 @@ Rectangle {
         property bool on: false
         property bool flat: false       // toolbar style: no outline, solid black when on
         property bool enabledLook: true
+        property bool palmGuard: false  // pen only: for buttons where the drawing hand rests
         property int fontSize: 21
         readonly property color ink: on ? "white" : (enabledLook ? "black" : "#aaaaaa")
         signal tap
@@ -821,7 +822,8 @@ Rectangle {
             }
         }
         TapHandler {
-            acceptedDevices: PointerDevice.AllDevices & ~PointerDevice.TouchScreen // palms and fingers are touch; the pen is mouse or stylus to Qt
+            // palms and fingers are touch; the pen is mouse or stylus to Qt
+            acceptedDevices: btn.palmGuard ? PointerDevice.AllDevices & ~PointerDevice.TouchScreen : PointerDevice.AllDevices
             gesturePolicy: TapHandler.ReleaseWithinBounds
             onTapped: btn.tap()
             onLongPressed: btn.hold()
@@ -929,7 +931,7 @@ Rectangle {
             text: root.projectName
             font.pixelSize: 24; font.bold: true
             elide: Text.ElideRight
-            TapHandler { acceptedDevices: PointerDevice.AllDevices & ~PointerDevice.TouchScreen; onTapped: root.startRename() }
+            TapHandler { onTapped: root.startRename() }
         }
         Row {
             id: rightGroup
@@ -1046,6 +1048,7 @@ Rectangle {
                     Row {
                         spacing: 2
                         Btn {
+                            palmGuard: true
                             id: layerBtn
                             property bool armed: false
                             width: 130; height: 52
@@ -1060,6 +1063,7 @@ Rectangle {
                             Timer { id: disarmLayer; interval: 3000; onTriggered: layerBtn.armed = false }
                         }
                         Btn {
+                            palmGuard: true
                             width: 44; height: 52; flat: true
                             icon: root.historyRev >= 0 && root.layers[index] && root.layers[index].visible ? "eye" : "eye-off"
                             onTap: root.toggleLayer(index)
@@ -1067,6 +1071,7 @@ Rectangle {
                     }
                 }
                 Btn {
+                    palmGuard: true
                     visible: root.layerCount < root.maxLayers
                     width: 176; height: 40
                     label: "+ Layer"
@@ -1193,12 +1198,13 @@ Rectangle {
         }
 
         Bar {
-            Btn { icon: "prev"; flat: true; onTap: root.goTo(root.current - 1) }
-            Btn { icon: root.isPlaying ? "stop" : "play"; flat: true; on: root.isPlaying; onTap: root.isPlaying = !root.isPlaying }
-            Btn { icon: "next"; flat: true; onTap: root.goTo(root.current + 1) }
-            Btn { icon: "new"; flat: true; onTap: root.insertFrame(root.current + 1, null) }
-            Btn { icon: "copy"; flat: true; onTap: root.insertFrame(root.current + 1, root.frame) }
+            Btn { palmGuard: true; icon: "prev"; flat: true; onTap: root.goTo(root.current - 1) }
+            Btn { palmGuard: true; icon: root.isPlaying ? "stop" : "play"; flat: true; on: root.isPlaying; onTap: root.isPlaying = !root.isPlaying }
+            Btn { palmGuard: true; icon: "next"; flat: true; onTap: root.goTo(root.current + 1) }
+            Btn { palmGuard: true; icon: "new"; flat: true; onTap: root.insertFrame(root.current + 1, null) }
+            Btn { palmGuard: true; icon: "copy"; flat: true; onTap: root.insertFrame(root.current + 1, root.frame) }
             Btn {
+                palmGuard: true
                 id: delBtn
                 property bool armed: false
                 icon: "delete"
@@ -1212,6 +1218,7 @@ Rectangle {
                 Timer { id: disarm; interval: 3000; onTriggered: delBtn.armed = false }
             }
             Btn {
+                palmGuard: true
                 id: holdBtn
                 property bool armed: false
                 readonly property bool held: root.historyRev >= 0 && root.layerCount > 0 && root.current < root.frameCount
@@ -1231,14 +1238,15 @@ Rectangle {
                 Timer { id: disarmHold; interval: 3000; onTriggered: holdBtn.armed = false }
             }
             Btn {
+                palmGuard: true
                 icon: "onion"
                 label: root.onionDepth ? root.onionDepth : "Off"
                 flat: true
                 enabledLook: root.onionDepth > 0
                 onTap: root.onionDepth = (root.onionDepth + 1) % 4
             }
-            Btn { label: root.fps + " fps"; flat: true; onTap: root.fpsIndex = (root.fpsIndex + 1) % root.fpsOptions.length }
-            Btn { label: "Clear"; flat: true; onTap: root.clearFrame() }
+            Btn { palmGuard: true; label: root.fps + " fps"; flat: true; onTap: root.fpsIndex = (root.fpsIndex + 1) % root.fpsOptions.length }
+            Btn { palmGuard: true; label: "Clear"; flat: true; onTap: root.clearFrame() }
         }
     }
 
@@ -1390,7 +1398,7 @@ Rectangle {
                 Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: 1; color: "#aaaaaa" }
                 Item { // tap the row to open it; the trash keeps its own taps
                     width: trash.x; height: parent.height
-                    TapHandler { acceptedDevices: PointerDevice.AllDevices & ~PointerDevice.TouchScreen; onTapped: root.openProject(modelData.id) }
+                    TapHandler { onTapped: root.openProject(modelData.id) }
                 }
                 Btn {
                     id: trash
