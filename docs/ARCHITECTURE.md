@@ -7,7 +7,7 @@ running inside xochitl (the reMarkable UI), plus a tiny native backend for pen p
 | File | Job |
 |---|---|
 | `src/main.qml` | UI, pen input, rendering, frame/undo model, projects, export upload |
-| `src/ExportWorker.js` | Rasterizes frames and encodes the 1-bit animated GIF (WorkerScript thread) |
+| `src/ExportWorker.js` | Builds the export: 1-bit animated GIF, animated SVG, a zip of SVG frames or a PDF flipbook (WorkerScript thread) |
 | `src/StorageWorker.js` | Saves, loads and lists projects as JSON (WorkerScript thread) |
 | `src/QrCode.js` | QR code generator (byte mode, level M) for the share screen |
 | `backend/pen.c` → `src/backend/entry` | Streams Marker pressure, tilt and eraser end to the frontend |
@@ -27,6 +27,9 @@ running inside xochitl (the reMarkable UI), plus a tiny native backend for pen p
 | AppLoad's virtual keyboard only serves framebuffer apps. | Rename has its own on-screen keyboard. |
 
 ## Data
-Projects live in `/home/root/.local/share/remarkable-animator/`: `index.json` lists them and
-each `<id>.json` holds its frames. Strokes are stored compactly as
-`{ t: tool, c: color, p: [x, y, width, ...] }`.
+Projects live in `/home/root/.local/share/remarkable-animator/`: `index.json` lists them (with a
+small thumbnail of frame 1) and each `<id>.json` holds
+`{ id, name, fps, length, layers: [{ name, visible, cels: [{ at, strokes }] }] }`: a layer's drawing
+at frame `at` holds until its next cel. Strokes are stored compactly as
+`{ t: tool, c: color, p: [x, y, width, ...] }`; black is finished ink, any other color is planning
+ink (never exported). Files from before layers (`frames: [strokes]`) open as one layer.
