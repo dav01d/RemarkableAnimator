@@ -36,8 +36,8 @@ The response may be plain text containing the link, or JSON with a `url` field.
 python -m ziglang cc -target aarch64-linux-musl -O2 -static -s -o src/backend/entry backend/pen.c
 # QML resources, with PySide6's rcc
 rcc --binary src/resources.qrc -o src/resources.rcc
-# Copy to the tablet, then exit and reopen the app (AppLoad reloads it on launch)
-.\deploy.ps1
+# Close the app on the tablet, then copy and restart xochitl (AppLoad caches the app until then)
+.\deploy.ps1 -Restart
 ```
 Machine-specific deploy settings (tablet Wi-Fi IP, an SSH askpass helper) go in a git-ignored
 `deploy.local.ps1`; see the top of `deploy.ps1`.
