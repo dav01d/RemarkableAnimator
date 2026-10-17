@@ -1,12 +1,13 @@
 // Runs in a WorkerScript thread: rasterizing and encoding takes seconds on the tablet, and
 // doing it on the UI thread stalls xochitl until its watchdog kills it.
-// job = { format: "gif" | "svg" | "zip", frames: [[{ name, strokes: [stroke] }]] (per frame, layers
+// job = { format: "gif" | "svg" | "zip" | "pdf", frames: [[{ name, strokes: [stroke] }]] (per frame, layers
 //         bottom first), W, H, k (GIF size and scale), stageW, stageH, fps }
 //   -> replies { progress } ... then { bytes }
 
 WorkerScript.onMessage = function(job) {
     if (job.format === "svg") return WorkerScript.sendMessage({ bytes: svgAnimation(job) });
     if (job.format === "zip") return WorkerScript.sendMessage({ bytes: svgFrames(job) });
+    if (job.format === "pdf") return WorkerScript.sendMessage({ bytes: pdfFlipbook(job) });
     var gif = createGif(job.W, job.H, job.fps);
     for (var i = 0; i < job.frames.length; i++) {
         WorkerScript.sendMessage({ progress: "Encoding frame " + (i + 1) + " of " + job.frames.length + "..." });
@@ -64,6 +65,40 @@ function svgFrames(job) {
     return Array.from(zip(job.frames.map(function(f, i) {
         return { name: "frame-" + ("00" + (i + 1)).slice(-3) + ".svg", data: bytes(svgDoc(job, layersSvg(f))) };
     })));
+}
+
+// PDF: one page per frame, the strokes as vector lines (round caps draw single points as dots)
+function pdfFlipbook(job) {
+    var H = job.stageH, objects = [], pages = [];
+    job.frames.forEach(function(layers) {
+        var ops = ["1 J 1 j 0 G"];
+        layers.forEach(function(l) {
+            l.strokes.forEach(function(s) {
+                var pts = s.pts;
+                for (var i = 0; i < pts.length; ) {
+                    var w = pts[i].w, a = pts[Math.max(0, i - 1)], line = [w + " w", r1(a.x) + " " + r1(H - a.y) + " m"];
+                    if (i === 0) i = 1; // a lone point: a zero-length line
+                    do { var p = pts[Math.min(i, pts.length - 1)]; line.push(r1(p.x) + " " + r1(H - p.y) + " l"); i++; }
+                    while (i < pts.length && pts[i].w === w);
+                    ops.push(line.join(" ") + " S");
+                }
+            });
+        });
+        var content = ops.join("\n");
+        objects.push("<< /Length " + content.length + " >>\nstream\n" + content + "\nendstream");
+        pages.push(objects.length + 3); // its page object: after the content, once Catalog and Pages are in front
+        objects.push("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 " + job.stageW + " " + H + "] /Contents " +
+                     (objects.length + 2) + " 0 R >>");
+    });
+    objects.unshift("<< /Type /Catalog /Pages 2 0 R >>",
+                    "<< /Type /Pages /Kids [" + pages.map(function(n) { return n + " 0 R"; }).join(" ") + "] /Count " + pages.length + " >>");
+    var out = "%PDF-1.4\n", offsets = [];
+    objects.forEach(function(o, i) { offsets.push(out.length); out += (i + 1) + " 0 obj\n" + o + "\nendobj\n"; });
+    var xref = out.length;
+    out += "xref\n0 " + (objects.length + 1) + "\n0000000000 65535 f \n" +
+           offsets.map(function(o) { return ("000000000" + o).slice(-10) + " 00000 n \n"; }).join("") +
+           "trailer\n<< /Size " + (objects.length + 1) + " /Root 1 0 R >>\nstartxref\n" + xref + "\n%%EOF\n";
+    return Array.from(bytes(out));
 }
 
 function bytes(text) {
