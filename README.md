@@ -3,21 +3,40 @@
 Flipbook animation **on** the reMarkable Paper Pro Move: draw frames with the Marker, play them
 back on the tablet, and share them to your phone via QR code.
 
+<p align="center"><img src="docs/images/drawing.png" width="480" alt="Animator on the tablet: a bouncing ball on its own layer over a held ground layer, with onion skin showing the previous frames in grey and the next one in blue"></p>
+
 ## Features
 - Pressure-sensitive pen in 3 sizes; flip the Marker (or tap the eraser button) to erase
-- Black ink for finished lines, light planning ink for roughs: **Plan** hides it, and exports
-  always leave it out
+- Black ink for finished lines, light grey for roughs (exports leave grey out). Or sketch on its
+  own layer and hide it with the layer's eye
 - Up to 3 layers with names; a layer can **Hold** a drawing across frames instead of redrawing it
 - Onion skin: earlier drawings in fading grey, the next one in light blue
 - Timeline and project list with thumbnails; drag frames to reorder; playback at 6–24 fps
 - Undo/redo, rename, delete; everything autosaves on the tablet (works offline)
-- Palm rejection: a resting hand can't draw or press buttons
-- Share as a GIF, an animated SVG, a zip of SVG frames, or a PDF flipbook (one page per frame,
-  which your phone can send on to the reMarkable app). Two ways to get it to your phone:
-  - **Upload link:** uploaded to [catbox.moe](https://catbox.moe) and shared via a QR code
-    (only when you share)
-  - **Wi-Fi (no cloud):** the tablet serves the file itself for 10 minutes, and the QR code
-    points at it (your phone must be on the same network)
+- Palm rejection: a resting hand can't draw or press the timeline and bottom bar; fingers still
+  work on the top bar, keyboard and menus, in case you put the pen down
+- Share to your phone with a QR code (see below)
+
+## Sharing
+Tap the share button (top right), pick how the link reaches your phone, then a format:
+
+<p align="center"><img src="docs/images/share-options.png" width="560" alt="The share screen: Upload link or Wi-Fi (no cloud), then GIF, Animated SVG, SVG frames or PDF flipbook"></p>
+
+- **Upload link:** the file is uploaded to [catbox.moe](https://catbox.moe) (anonymous, only when
+  you share). To use your own server instead, see [Upload target](#upload-target).
+- **Wi-Fi (no cloud):** the tablet serves the file itself for 10 minutes while Animator stays open.
+  Your phone must be on the same Wi-Fi.
+
+| Format | Good for |
+|---|---|
+| **GIF** | Plays anywhere: messages, social posts |
+| **Animated SVG** | One small file that loops in any browser and stays sharp at any size |
+| **SVG frames** | A zip with one SVG per frame (layers as groups), for Illustrator, Inkscape or Figma |
+| **PDF flipbook** | One page per frame; from your phone you can send it to the reMarkable app |
+
+Then scan the code with your phone's camera:
+
+<p align="center"><img src="docs/images/share-ready.png" width="420" alt="Your GIF is ready: a QR code and the link (an example link here)"></p>
 
 ## What you need
 - A reMarkable Paper Pro Move on software version 3.28
@@ -28,6 +47,9 @@ back on the tablet, and share them to your phone via QR code.
 > Turning it off later is another reset. Modding is at your own risk.
 
 ## Install
+About 20 minutes the first time. You'll: back up, turn on Developer Mode, add the two community
+tools that let the tablet run apps (XOVI and AppLoad), then copy Animator over.
+**Already have XOVI and AppLoad?** Skip to [step 4](#4-install-animator).
 
 ### 1. Back up your tablet
 Let the tablet finish syncing, then check on [my.remarkable.com](https://my.remarkable.com) or in
@@ -79,8 +101,9 @@ then [AppLoad](https://github.com/asivery/rm-appload).)
 - **After a reMarkable software update:** updates switch the mods off, and AppLoad currently needs
   version 3.28, so hold off on updating if you can. With Vellum, `vellum reenable` turns them
   back on.
-- **Updating Animator:** download the new ZIP and repeat step 4, but first close Animator on the
-  tablet (restarting the tablet's UI while the app is open can crash it).
+- **Updating Animator:** first close Animator on the tablet with its ✕ (restarting the tablet's UI
+  while the app is open can crash it), then download the new ZIP and repeat step 4. Your
+  animations are kept.
 
 ## Upload target
 Exports go to catbox.moe by default (anonymous, no account). To use your own server, create
