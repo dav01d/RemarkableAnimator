@@ -42,7 +42,6 @@ Rectangle {
     property string inkColor: "#000000"
     readonly property string planInk: "#c0c0c0"
     property bool eraserTool: false
-    property bool showPlanning: true    // planning ink on screen; export always leaves it out
     property var sizes: [2, 5, 10]
     property int sizeIndex: 1
 
@@ -97,10 +96,6 @@ Rectangle {
 
     onCurrentChanged: refreshLayers()
     onCurrentLayerChanged: refreshLayers()
-    onShowPlanningChanged: {
-        drawings().forEach(d => d.full = true);
-        refreshLayers();
-    }
 
     // Latency probe: pen move -> next frame the window has drawn (app side only; the e-ink
     // panel adds its own refresh on top)
@@ -569,7 +564,6 @@ Rectangle {
     function isPlanning(s) { return s.color !== "#000000"; }
 
     function drawStroke(ctx, s, strength, tint) {
-        if (!showPlanning && isPlanning(s)) return;
         var pts = s.pts, color = strength ? fade(tint || s.color, strength) : s.color;
         ctx.globalCompositeOperation = s.tool === "area" ? "destination-out" : "source-over";
         ctx.strokeStyle = color;
@@ -699,7 +693,6 @@ Rectangle {
         var R = 16, strokes = frame.strokes, hitAny = false;
         for (var i = strokes.length - 1; i >= 0; i--) {
             var s = strokes[i], b = bounds(s), reach = R + b.w / 2;
-            if (!showPlanning && isPlanning(s)) continue; // don't rub out what you can't see
             if (x < b.x0 - reach || x > b.x1 + reach || y < b.y0 - reach || y > b.y1 + reach) continue;
             var pieces = [], run = [], hit = false;
             for (var j = 0; j < s.pts.length; j++) {
@@ -964,7 +957,7 @@ Rectangle {
                     on: root.inkColor === modelData && !root.eraserTool
                     flat: true
                     width: 58
-                    onTap: { root.inkColor = modelData; root.eraserTool = false; if (index) root.showPlanning = true; }
+                    onTap: { root.inkColor = modelData; root.eraserTool = false; }
                     Rectangle { anchors.centerIn: parent; width: 30; height: 30; radius: 6; color: modelData; border.color: "white"; border.width: 2 }
                 }
             }
@@ -1003,11 +996,11 @@ Rectangle {
         Item { id: liveLayer; anchors.fill: parent; z: 1 } // pen preview above the frames
 
         // Tell xochitl which e-ink waveform to use for this region. UFast puts the live stroke
-        // on the panel noticeably sooner; it's 1-bit, so grey ink settles when Fast takes over
+        // (and the eraser's gaps) on the panel noticeably sooner; it's 1-bit, so grey ink settles when Fast takes over
         DisplayMethodArea {
             anchors.fill: parent
             displayMethod: root.isPlaying ? DisplayMethodArea.Animate
-                         : root.live ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
+                         : root.live || root.liveErasing ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
         }
 
         // The Marker reaches AppLoad apps as plain (non-synthesized) mouse events. Fingers
@@ -1244,15 +1237,8 @@ Rectangle {
                 enabledLook: root.onionDepth > 0
                 onTap: root.onionDepth = (root.onionDepth + 1) % 4
             }
-            Btn {
-                icon: root.showPlanning ? "eye" : "eye-off"
-                label: "Grey" // show or hide the grey (planning) lines
-                flat: true
-                enabledLook: root.showPlanning
-                onTap: root.showPlanning = !root.showPlanning
-            }
             Btn { label: root.fps + " fps"; flat: true; onTap: root.fpsIndex = (root.fpsIndex + 1) % root.fpsOptions.length }
-            Btn { label: "Clear"; flat: true; visible: !delBtn.armed && !holdBtn.armed; onTap: root.clearFrame() } // makes room for "Sure?" so the bar never wraps
+            Btn { label: "Clear"; flat: true; onTap: root.clearFrame() }
         }
     }
 
