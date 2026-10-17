@@ -19,7 +19,7 @@ Rectangle {
 
     // ---------------------------------------------------------------
     // MODEL
-    // frames[i] = { canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item] }
+    // frames[i] = { key, canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item], dirty, unsaved }
     // stroke    = { tool, color, pts: [{x, y, w}] }
     // op        = { t: "add", s } | { t: "swap", before: [stroke], after: [stroke] }
     // ---------------------------------------------------------------
@@ -27,6 +27,7 @@ Rectangle {
     property int frameCount: 0
     property int current: 0
     property int historyRev: 0 // bumped on every edit so Undo/Redo enablement re-evaluates
+    property int frameKeys: 0  // last frame key handed out; the storage worker caches saved frames by key
 
     // Tools
     // One pressure-sensitive pen in three sizes, black or grey. Flip the Marker to erase.
@@ -117,11 +118,16 @@ Rectangle {
     function saveProject() {
         if (!projectId) return;
         saveTimer.stop();
-        var t0 = Date.now(), data = [];
-        for (var i = 0; i < frames.length; i++) data.push(frames[i].strokes);
+        // Handing strokes to the worker copies them on this thread, so send only edited frames
+        var t0 = Date.now(), order = [], changed = {}, n = 0;
+        for (var i = 0; i < frames.length; i++) {
+            var f = frames[i];
+            order.push(f.key);
+            if (f.unsaved) { changed[f.key] = f.strokes; f.unsaved = false; n++; }
+        }
         storage.sendMessage({ op: "save", dir: storageDir,
-                              project: { id: projectId, name: projectName, fps: fps, frames: data } });
-        console.log("[Animator][perf] save handoff", Date.now() - t0, "ms");
+                              project: { id: projectId, name: projectName, fps: fps, order: order, changed: changed } });
+        console.log("[Animator][perf] save handoff", n, "of", order.length, "frames,", Date.now() - t0, "ms");
     }
 
     function newProject() {
@@ -213,7 +219,7 @@ Rectangle {
     // FRAMES
     // ---------------------------------------------------------------
     function insertFrame(at, copyFrom) {
-        var f = { strokes: copyFrom ? copyFrom.strokes.slice() : [], undo: [], redo: [], queue: [], full: true, trash: [] };
+        var f = { key: ++frameKeys, strokes: copyFrom ? copyFrom.strokes.slice() : [], undo: [], redo: [], queue: [], full: true, trash: [], unsaved: true };
         f.canvas = canvasComp.createObject(stage);
         frames.splice(at, 0, f);
         frameCount = frames.length;
@@ -417,6 +423,7 @@ Rectangle {
     function pushOp(op) {
         frame.undo.push(op);
         frame.redo = [];
+        frame.unsaved = true;
         historyRev++;
     }
 
@@ -426,6 +433,7 @@ Rectangle {
         if (op.t === "add") f.strokes.splice(f.strokes.indexOf(op.s), 1);
         else f.strokes = op.before.slice();
         f.redo.push(op);
+        f.unsaved = true;
         repaint(f);
         historyRev++;
     }
@@ -436,6 +444,7 @@ Rectangle {
         if (op.t === "add") f.strokes.push(op.s);
         else f.strokes = op.after.slice();
         f.undo.push(op);
+        f.unsaved = true;
         repaint(f);
         historyRev++;
     }
