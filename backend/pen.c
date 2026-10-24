@@ -38,18 +38,24 @@ static int send_msg(int fd, uint32_t type, const char *text) {
     return header[1] ? (int)send(fd, text, header[1], 0) : 0;
 }
 
+#define HAS_BIT(bits, n) ((bits)[(n) / 8] >> ((n) % 8) & 1)
+
+// The pen is the device with pressure and a pen tool, whatever it's called: "Elan marker
+// input" on the Paper Pro, "Wacom I2C Digitizer" on the reMarkable 2
 static int open_pen(void) {
     DIR *dir = opendir("/dev/input");
     struct dirent *e;
     int found = -1;
     while (dir && found < 0 && (e = readdir(dir))) {
         if (strncmp(e->d_name, "event", 5)) continue;
-        char path[64], name[128] = "";
+        char path[64];
+        unsigned char abs_bits[ABS_MAX / 8 + 1] = {0}, key_bits[KEY_MAX / 8 + 1] = {0};
         snprintf(path, sizeof path, "/dev/input/%s", e->d_name);
         int fd = open(path, O_RDONLY | O_NONBLOCK);
         if (fd < 0) continue;
-        ioctl(fd, EVIOCGNAME(sizeof name), name);
-        if (strstr(name, "marker")) found = fd; else close(fd);
+        ioctl(fd, EVIOCGBIT(EV_ABS, sizeof abs_bits), abs_bits);
+        ioctl(fd, EVIOCGBIT(EV_KEY, sizeof key_bits), key_bits);
+        if (HAS_BIT(abs_bits, ABS_PRESSURE) && HAS_BIT(key_bits, BTN_TOOL_PEN)) found = fd; else close(fd);
     }
     if (dir) closedir(dir);
     return found;
@@ -81,7 +87,7 @@ int main(int argc, char **argv) {
     }
 
     int pen = open_pen();
-    if (pen < 0) { fprintf(stderr, "[pen] marker input device not found\n"); return 1; }
+    if (pen < 0) { fprintf(stderr, "[pen] pen input device not found\n"); return 1; }
 
     struct input_absinfo ap = {0}, atx = {0}, aty = {0};
     ioctl(pen, EVIOCGABS(ABS_PRESSURE), &ap);

@@ -62,7 +62,7 @@ Write-Host "Copying files to $remoteAppDir..."
 scp -o StrictHostKeyChecking=no -r "$srcDir/*" "root@${ip}:${remoteAppDir}/"
 
 Write-Host "Setting executable permissions..."
-ssh -o StrictHostKeyChecking=no root@$ip "chmod +x $remoteAppDir/backend/entry 2>/dev/null || true"
+ssh -o StrictHostKeyChecking=no root@$ip "chmod +x $remoteAppDir/backend/entry $remoteAppDir/backend/*/entry 2>/dev/null || true"
 
 # AppLoad caches the app's resources.rcc until xochitl restarts, so reopening the app still runs
 # the old code. -Restart reloads xochitl; if a reboot wiped XOVI's tmpfs hook, xovi/start

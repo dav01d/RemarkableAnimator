@@ -1,4 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 *.sh text eol=lf
+src/backend/entry text eol=lf
 VELBUILD text eol=lf
