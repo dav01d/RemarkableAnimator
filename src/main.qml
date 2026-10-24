@@ -688,17 +688,21 @@ Rectangle {
         return s.box;
     }
 
-    // Rub out only what's under the eraser: drop the covered points and split the stroke
-    // into the pieces that remain (like the notebook app's eraser)
-    function eraseAt(x, y) {
+    // Rub out only what the eraser covered moving from (x0, y0) to (x, y): drop the covered
+    // points and split the stroke into the pieces that remain (like the notebook app's eraser).
+    // One pass per pen move, each point measured once against the whole path: a long scribble
+    // is thousands of points, too many to re-check every few pixels on the reMarkable 2
+    function eraseAlong(x0, y0, x, y) {
         var R = 16, strokes = frame.strokes, hitAny = false;
+        var dx = x - x0, dy = y - y0, len2 = dx * dx + dy * dy;
+        var minX = Math.min(x0, x), maxX = Math.max(x0, x), minY = Math.min(y0, y), maxY = Math.max(y0, y);
         for (var i = strokes.length - 1; i >= 0; i--) {
             var s = strokes[i], b = bounds(s), reach = R + b.w / 2;
-            if (x < b.x0 - reach || x > b.x1 + reach || y < b.y0 - reach || y > b.y1 + reach) continue;
+            if (maxX < b.x0 - reach || minX > b.x1 + reach || maxY < b.y0 - reach || minY > b.y1 + reach) continue;
             var pieces = [], run = [], hit = false;
             for (var j = 0; j < s.pts.length; j++) {
-                var p = s.pts[j];
-                if (Math.hypot(p.x - x, p.y - y) < R + p.w / 2) {
+                var p = s.pts[j], r = R + p.w / 2;
+                if (p.x > minX - r && p.x < maxX + r && p.y > minY - r && p.y < maxY + r && nearPath(p.x - x0, p.y - y0, dx, dy, len2, r)) {
                     hit = true;
                     if (run.length) pieces.push(run);
                     run = [];
@@ -715,8 +719,14 @@ Rectangle {
         if (hitAny) {
             eraseOp.hit = true;
             var pad = R + 20; // covers the removed ink and the new round ends
-            repaintArea(frame, { x: x - pad, y: y - pad, w: 2 * pad, h: 2 * pad });
+            repaintArea(frame, { x: minX - pad, y: minY - pad, w: maxX - minX + 2 * pad, h: maxY - minY + 2 * pad });
         }
+    }
+
+    // Whether a point (px, py), relative to the path's start, is within r of the path (dx, dy)
+    function nearPath(px, py, dx, dy, len2, r) {
+        var t = len2 && Math.max(0, Math.min(1, (px * dx + py * dy) / len2)), ex = px - t * dx, ey = py - t * dy;
+        return ex * ex + ey * ey < r * r;
     }
 
     // ---------------------------------------------------------------
@@ -728,7 +738,7 @@ Rectangle {
         if (eraserEnd) {
             liveErasing = true;
             eraseOp = { x: x, y: y, before: frame.strokes.slice(), hit: false };
-            eraseAt(x, y);
+            eraseAlong(x, y, x, y);
             return;
         }
         var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
@@ -747,9 +757,8 @@ Rectangle {
     function moveGestureImpl(pt) {
         var x = pt.position.x, y = pt.position.y;
         if (liveErasing) {
-            // Sweep the eraser along the path so fast swipes don't skip strokes
-            var n = Math.ceil(Math.hypot(x - eraseOp.x, y - eraseOp.y) / 8);
-            for (var k = 1; k <= n; k++) eraseAt(eraseOp.x + (x - eraseOp.x) * k / n, eraseOp.y + (y - eraseOp.y) * k / n);
+            // Erase along the whole path since the last move so fast swipes don't skip strokes
+            eraseAlong(eraseOp.x, eraseOp.y, x, y);
             eraseOp.x = x; eraseOp.y = y;
             return;
         }
