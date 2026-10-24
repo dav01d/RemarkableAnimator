@@ -666,8 +666,9 @@ Rectangle {
     }
 
     function clearFrame() {
+        if (!frame.strokes.length) return;
+        if (!layers[currentLayer].cels[current]) toggleHold(); // held: clear a copy, not the earlier frame
         var f = frame;
-        if (!f.strokes.length) return;
         pushOp({ t: "swap", before: f.strokes.slice(), after: [] });
         spliceStrokes(f, 0, f.strokes.length, []);
         repaint(f);
@@ -1655,5 +1656,22 @@ Rectangle {
         id: shareTimeout
         interval: 5000
         onTriggered: { root.isExporting = false; root.statusMessage = "The tablet's share server didn't answer"; }
+    }
+
+    // Startup refresh: the panel keeps a ghost of xochitl's menu, so flash the whole screen
+    // black then white on a full-quality waveform, as xochitl does every so often
+    readonly property int flashMs: 500  // how long each step of the flash stays up
+    Rectangle {
+        id: flash
+        anchors.fill: parent
+        z: 1000
+        color: "black"
+        DisplayMethodArea { anchors.fill: parent; displayMethod: DisplayMethodArea.Content }
+        Timer {
+            running: true
+            interval: root.flashMs
+            repeat: true
+            onTriggered: if (flash.color == "#000000") flash.color = "white"; else { flash.visible = false; stop(); }
+        }
     }
 }
