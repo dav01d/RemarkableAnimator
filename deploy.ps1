@@ -2,6 +2,7 @@
 param (
     [string]$TargetIp = "10.11.99.1",   # USB address of every reMarkable; put your Wi-Fi IP in deploy.local.ps1
     [string]$FallbackIp = "10.11.99.1",
+    [string]$Device,  # an SSH host from ~/.ssh/config instead of an IP, e.g. rm2
     [switch]$Restart  # also restart xochitl, which is what loads the new code (close the app first)
 )
 
@@ -27,42 +28,49 @@ if ($askpass -and (Test-Path $askpass)) {
     $env:DISPLAY = "dummy"
 }
 
-# Test connectivity
-$ip = $TargetIp
-Write-Host "Checking connection to $ip:22..." -NoNewline
-$tcp = New-Object System.Net.Sockets.TcpClient
-$async = $tcp.BeginConnect($ip, 22, $null, $null)
-$success = $async.AsyncWaitHandle.WaitOne(2000)
-
-if (-not $success) {
-    Write-Host " TIMEOUT" -ForegroundColor Yellow
-    Write-Host "Trying fallback USB IP $FallbackIp:22..." -NoNewline
-    $ip = $FallbackIp
+# Every tablet is 10.11.99.1 over USB, each with its own host key and password: -Device names
+# an SSH host that knows which one it is, so the IP check below is skipped
+if ($Device) {
+    $dest = $Device
+} else {
+    # Test connectivity
+    $ip = $TargetIp
+    Write-Host "Checking connection to $ip:22..." -NoNewline
     $tcp = New-Object System.Net.Sockets.TcpClient
     $async = $tcp.BeginConnect($ip, 22, $null, $null)
     $success = $async.AsyncWaitHandle.WaitOne(2000)
+
     if (-not $success) {
-        Write-Host " FAILED" -ForegroundColor Red
-        Write-Error "Could not connect to tablet at $TargetIp or $FallbackIp. Ensure Wi-Fi or USB cable is connected."
+        Write-Host " TIMEOUT" -ForegroundColor Yellow
+        Write-Host "Trying fallback USB IP $FallbackIp:22..." -NoNewline
+        $ip = $FallbackIp
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $async = $tcp.BeginConnect($ip, 22, $null, $null)
+        $success = $async.AsyncWaitHandle.WaitOne(2000)
+        if (-not $success) {
+            Write-Host " FAILED" -ForegroundColor Red
+            Write-Error "Could not connect to tablet at $TargetIp or $FallbackIp. Ensure Wi-Fi or USB cable is connected."
+        }
     }
+    Write-Host " CONNECTED ($ip)" -ForegroundColor Green
+    $tcp.Close()
+    $dest = "root@$ip"
 }
-Write-Host " CONNECTED ($ip)" -ForegroundColor Green
-$tcp.Close()
 
 # Target app directory on device
 $remoteAppDir = "/home/root/xovi/exthome/appload/RemarkableAnimator"
 
 Write-Host "Ensuring remote directory exists..."
-ssh -o StrictHostKeyChecking=no root@$ip "mkdir -p $remoteAppDir /home/root/.local/share/remarkable-animator"  # app + saved animations
+ssh -o StrictHostKeyChecking=no $dest "mkdir -p $remoteAppDir /home/root/.local/share/remarkable-animator"  # app + saved animations
 
 # A running backend can't be overwritten ("text file busy"); stop ours first
-ssh -o StrictHostKeyChecking=no root@$ip 'for p in $(pidof entry); do readlink /proc/$p/exe | grep -q RemarkableAnimator && kill $p; done; true'
+ssh -o StrictHostKeyChecking=no $dest 'for p in $(pidof entry); do readlink /proc/$p/exe | grep -q RemarkableAnimator && kill $p; done; true'
 
 Write-Host "Copying files to $remoteAppDir..."
-scp -o StrictHostKeyChecking=no -r "$srcDir/*" "root@${ip}:${remoteAppDir}/"
+scp -o StrictHostKeyChecking=no -r "$srcDir/*" "${dest}:${remoteAppDir}/"
 
 Write-Host "Setting executable permissions..."
-ssh -o StrictHostKeyChecking=no root@$ip "chmod +x $remoteAppDir/backend/entry $remoteAppDir/backend/*/entry 2>/dev/null || true"
+ssh -o StrictHostKeyChecking=no $dest "chmod +x $remoteAppDir/backend/entry $remoteAppDir/backend/*/entry 2>/dev/null || true"
 
 # AppLoad caches the app's resources.rcc until xochitl restarts, so reopening the app still runs
 # the old code. -Restart reloads xochitl; if a reboot wiped XOVI's tmpfs hook, xovi/start
@@ -72,7 +80,7 @@ if (-not $Restart) {
     exit 0
 }
 Write-Host "Reloading the tablet UI..."
-ssh -o StrictHostKeyChecking=no root@$ip "if [ -f /etc/systemd/system/xochitl.service.d/00-xovi.conf ]; then systemctl restart xochitl; else bash /home/root/xovi/start; fi"
+ssh -o StrictHostKeyChecking=no $dest "if [ -f /etc/systemd/system/xochitl.service.d/00-xovi.conf ]; then systemctl restart xochitl; else bash /home/root/xovi/start; fi"
 
 Write-Host "==========================================" -ForegroundColor Green
 Write-Host "  Deployment Complete!                     " -ForegroundColor Green

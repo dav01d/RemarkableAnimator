@@ -774,7 +774,7 @@ Rectangle {
             console.log("[Animator][perf] stroke", s.pts.length, "pts,", Object.keys(live.tiles).length, "tiles,", live.ev || 0, "moves,",
                         live.ms || 0, "ms JS (", ((live.ms || 0) / Math.max(1, live.ev || 0)).toFixed(1), "ms/move ),",
                         live.frames || 0, "frames, move->frame avg", ((live.lat || 0) / Math.max(1, live.frames || 0)).toFixed(0),
-                        "ms max", live.latMax || 0, "ms");
+                        "ms max", live.latMax || 0, "ms,", live.palm || 0, "palm moves refused");
         }
         live = null;
         moveWaiting = 0;
@@ -1008,7 +1008,8 @@ Rectangle {
 
         // The Marker reaches AppLoad apps as plain (non-synthesized) mouse events. Fingers
         // arrive as synthesized ones; refusing those means palms never draw. The eraser end
-        // is reported by the pen backend (or as a non-left button).
+        // is reported by the pen backend (or as a non-left button). On the reMarkable 2 a resting
+        // palm's moves and releases also reach the stroke, so those are refused too.
         MouseArea {
             anchors.fill: parent
             acceptedButtons: Qt.AllButtons
@@ -1018,8 +1019,11 @@ Rectangle {
                 root.beginGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure },
                                   root.eraserTool || root.penEraser || m.button !== Qt.LeftButton);
             }
-            onPositionChanged: (m) => root.moveGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure })
-            onReleased: root.endGesture()
+            onPositionChanged: (m) => {
+                if (m.source === Qt.MouseEventNotSynthesized) root.moveGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure });
+                else if (root.live) root.live.palm = (root.live.palm || 0) + 1;
+            }
+            onReleased: (m) => { if (m.source === Qt.MouseEventNotSynthesized) root.endGesture(); }
             onCanceled: root.endGesture()
         }
 
