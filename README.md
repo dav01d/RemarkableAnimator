@@ -17,8 +17,8 @@ animated SVG (the SVG stays sharp at any size).
 
 ## Features
 - Pressure-sensitive pen in 3 sizes; flip the pen (or tap the eraser button) to erase
-- Black ink for finished lines, light grey for roughs (exports leave grey out). Or sketch on its
-  own layer and hide it with the layer's eye
+- Rough on its own layer, then tap its eye to fade it to half strength and draw clean on top
+  (tap again to hide it)
 - Up to 3 layers with names; a layer can **Hold** a drawing across frames instead of redrawing it
 - Onion skin: earlier drawings in fading grey, the next one in light blue
 - Timeline and project list with thumbnails; drag frames to reorder; playback at 6–24 fps

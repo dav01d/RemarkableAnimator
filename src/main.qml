@@ -38,10 +38,8 @@ Rectangle {
     property int frameKeys: 0  // last drawing key handed out; the storage worker caches saved drawings by key
 
     // Tools
-    // One pressure-sensitive pen in three sizes: black to finish, light grey to plan.
-    // Flip the Marker, or pick the eraser, to erase.
-    property string inkColor: "#000000"
-    readonly property string planInk: "#c0c0c0"
+    // One pressure-sensitive pen in three sizes, in black (older animations may have grey
+    // planning ink: it still shows, and exports leave it out). Flip the Marker, or pick the eraser, to erase.
     property bool eraserTool: false
     property var sizes: [2, 5, 10]
     property int sizeIndex: 1
@@ -936,7 +934,7 @@ Rectangle {
             return;
         }
         var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
-        live = { tool: "pen", color: inkColor, pts: [p], tiles: {} };
+        live = { tool: "pen", color: "#000000", pts: [p], tiles: {} };
         addSegment(live, p, p);
     }
 
@@ -1116,7 +1114,6 @@ Rectangle {
             case "next": c.moveTo(14, 8); c.lineTo(24, 18); c.lineTo(14, 28); break;
             case "play": c.moveTo(11, 7); c.lineTo(28, 18); c.lineTo(11, 29); c.closePath(); c.fill(); return;
             case "stop": c.rect(10, 10, 16, 16); c.fill(); return;
-            case "new": c.rect(8, 5, 20, 26); c.moveTo(18, 12); c.lineTo(18, 24); c.moveTo(12, 18); c.lineTo(24, 18); break;
             case "copy": c.rect(13, 11, 16, 21); c.moveTo(8, 26); c.lineTo(8, 5); c.lineTo(23, 5); break;
             case "delete": // trash can
                 c.moveTo(6, 9); c.lineTo(30, 9); c.moveTo(14, 9); c.lineTo(14, 5); c.lineTo(22, 5); c.lineTo(22, 9);
@@ -1169,22 +1166,18 @@ Rectangle {
                     flat: true
                     width: 58
                     onTap: { root.sizeIndex = index; root.eraserTool = false; }
-                    Rectangle {
+                    Canvas { // a pen line of this size
                         anchors.centerIn: parent
-                        width: 6 + index * 10; height: width; radius: width / 2
-                        color: parent.on ? "white" : "black"
+                        width: 44; height: 36
+                        readonly property color ink: parent.on ? "white" : "black"
+                        onInkChanged: requestPaint()
+                        onPaint: {
+                            var c = getContext("2d");
+                            c.reset();
+                            c.strokeStyle = ink; c.lineWidth = root.sizes[index]; c.lineCap = "round";
+                            c.beginPath(); c.moveTo(8, 24); c.bezierCurveTo(16, 4, 28, 32, 36, 12); c.stroke();
+                        }
                     }
-                }
-            }
-            Item { width: 12; height: 1 } // gap between groups
-            Repeater {
-                model: ["#000000", root.planInk]
-                Btn {
-                    on: root.inkColor === modelData && !root.eraserTool
-                    flat: true
-                    width: 58
-                    onTap: { root.inkColor = modelData; root.eraserTool = false; }
-                    Rectangle { anchors.centerIn: parent; width: 30; height: 30; radius: 6; color: modelData; border.color: "white"; border.width: 2 }
                 }
             }
             Btn { icon: "eraser"; flat: true; width: 58; on: root.eraserTool; onTap: root.eraserTool = !root.eraserTool }
@@ -1441,7 +1434,7 @@ Rectangle {
                 onTap: root.isPlaying = !root.isPlaying && root.frameCount > 1
             }
             Btn { palmGuard: true; icon: "next"; flat: true; onTap: root.goTo(root.current + 1) }
-            Btn { palmGuard: true; icon: "new"; flat: true; onTap: root.insertFrame(root.current + 1, null) }
+            Btn { palmGuard: true; label: "+ Frame"; flat: true; onTap: root.insertFrame(root.current + 1, null) }
             Btn { palmGuard: true; icon: "copy"; flat: true; onTap: root.insertFrame(root.current + 1, root.frame) }
             Btn {
                 palmGuard: true
