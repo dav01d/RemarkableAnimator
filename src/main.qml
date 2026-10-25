@@ -754,17 +754,41 @@ Rectangle {
         var b = bounds(s);
         if (!b.runs) {
             b.runs = [];
-            for (var i = 0; i < s.pts.length; i += eraseRun) {
-                var u = { i0: i, i1: Math.min(i + eraseRun, s.pts.length), x0: 1e9, y0: 1e9, x1: -1e9, y1: -1e9 };
-                for (var j = u.i0; j < u.i1; j++) {
-                    var p = s.pts[j];
-                    u.x0 = Math.min(u.x0, p.x); u.x1 = Math.max(u.x1, p.x);
-                    u.y0 = Math.min(u.y0, p.y); u.y1 = Math.max(u.y1, p.y);
-                }
-                b.runs.push(u);
-            }
+            for (var i = 0; i < s.pts.length; i += eraseRun) b.runs.push(boxOf(s.pts, i, Math.min(i + eraseRun, s.pts.length)));
         }
         return b.runs;
+    }
+
+    // The box of points i0..i1 (plain comparisons: Math calls are slow on the reMarkable 2)
+    function boxOf(pts, i0, i1) {
+        var u = { i0: i0, i1: i1, x0: 1e9, y0: 1e9, x1: -1e9, y1: -1e9 };
+        for (var j = i0; j < i1; j++) {
+            var p = pts[j];
+            if (p.x < u.x0) u.x0 = p.x;
+            if (p.x > u.x1) u.x1 = p.x;
+            if (p.y < u.y0) u.y0 = p.y;
+            if (p.y > u.y1) u.y1 = p.y;
+        }
+        return u;
+    }
+
+    // Points from..to of stroke s as a stroke of its own, with its boxes carried over from s's runs:
+    // measuring a long stroke's leftover afresh on every eraser move is what kept erasing slow
+    function pieceOf(s, from, to) {
+        var b = { x0: 1e9, y0: 1e9, x1: -1e9, y1: -1e9, w: s.box.w, runs: [] }; // w: at most the whole stroke's
+        for (var u of s.box.runs) {
+            var i0 = Math.max(u.i0, from), i1 = Math.min(u.i1, to);
+            if (i0 >= i1) continue;
+            var v = i0 === u.i0 && i1 === u.i1 ? { x0: u.x0, y0: u.y0, x1: u.x1, y1: u.y1 } : boxOf(s.pts, i0, i1);
+            v.i0 = i0 - from;
+            v.i1 = i1 - from;
+            b.runs.push(v);
+            if (v.x0 < b.x0) b.x0 = v.x0;
+            if (v.x1 > b.x1) b.x1 = v.x1;
+            if (v.y0 < b.y0) b.y0 = v.y0;
+            if (v.y1 > b.y1) b.y1 = v.y1;
+        }
+        return { tool: s.tool, color: s.color, pts: s.pts.slice(from, to), box: b };
     }
 
     // Rub out only what the eraser covered moving from (x0, y0) to (x, y): drop the covered
@@ -793,8 +817,7 @@ Rectangle {
             cut.push(s.pts.length);
             var repl = [], from = 0;
             for (var k = 0; k < cut.length; k++) {
-                var piece = s.pts.slice(from, cut[k]);
-                if (piece.length > 1) repl.push({ tool: s.tool, color: s.color, pts: piece });
+                if (cut[k] - from > 1) repl.push(pieceOf(s, from, cut[k]));
                 from = cut[k] + 1;
             }
             spliceStrokes(frame, i, 1, repl);
