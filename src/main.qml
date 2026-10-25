@@ -75,6 +75,7 @@ Rectangle {
     // Live gesture
     property var live: null             // stroke being drawn, plus tiles: { "col,row": { canvas, segs } }
     property int liveTile: 128          // px: size of the Canvas tiles the live stroke is drawn into
+    readonly property int minStep: isRm2 ? 4 : 2 // px between stroke points: half the points on the slower reMarkable 2
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
     property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
@@ -779,7 +780,7 @@ Rectangle {
         if (!live) return;
         var last = live.pts[live.pts.length - 1];
         var dx = x - last.x, dy = y - last.y;
-        if (dx * dx + dy * dy < 4) return; // 2px minimum step
+        if (dx * dx + dy * dy < minStep * minStep) return;
         var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
         live.pts.push(p);
         addSegment(live, last, p);
