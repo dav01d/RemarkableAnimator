@@ -447,7 +447,7 @@ Rectangle {
                 else dropTrash(d); // unbaked ink would float over other frames
             }
         }
-        onionCanvas.requestPaint();
+        if (onionCanvas.visible) onionCanvas.requestPaint(); // a hidden Canvas still paints: none while playing
         console.log("[Animator][perf] frame", current, "live items", liveLayer.children.length, "rM2", isRm2, Screen.width + "x" + Screen.height);
     }
 
@@ -1056,6 +1056,7 @@ Rectangle {
                 visible: !root.isPlaying && root.onionDepth > 0
                 renderTarget: Canvas.Image
                 renderStrategy: Canvas.Immediate
+                onVisibleChanged: if (visible) requestPaint()
                 onPaint: root.paintOnion(this)
             }
         }
@@ -1085,10 +1086,10 @@ Rectangle {
                                   root.eraserTool || root.penEraser || m.button !== Qt.LeftButton);
             }
             onPositionChanged: (m) => {
-                if (m.source === Qt.MouseEventNotSynthesized) root.moveGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure });
+                if (!root.isRm2 || m.source === Qt.MouseEventNotSynthesized) root.moveGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure });
                 else if (root.live) root.live.palm = (root.live.palm || 0) + 1;
             }
-            onReleased: (m) => { if (m.source === Qt.MouseEventNotSynthesized) root.endGesture(); }
+            onReleased: (m) => { if (!root.isRm2 || m.source === Qt.MouseEventNotSynthesized) root.endGesture(); }
             onCanceled: root.endGesture()
         }
 
