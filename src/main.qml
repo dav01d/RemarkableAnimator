@@ -19,7 +19,7 @@ Rectangle {
 
     // ---------------------------------------------------------------
     // MODEL
-    // layers[l] = { name, visible, cels: [drawing | null] }: top layer first, one cel per frame;
+    // layers[l] = { name, visible, faded, cels: [drawing | null] }: top layer first, one cel per frame;
     //             null holds the layer's drawing from an earlier frame
     // drawing   = { key, rev, canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item], dirty, edits }
     //             (rev counts edits, so a thumbnail knows when to redraw)
@@ -31,6 +31,7 @@ Rectangle {
     property int layerCount: 0
     property int currentLayer: 0
     readonly property int maxLayers: 3
+    readonly property real layerFade: 0.5 // how much of its ink a faded layer shows
     property int frameCount: 0
     property int current: 0
     property int historyRev: 0 // bumped on every edit so Undo/Redo enablement re-evaluates
@@ -200,7 +201,7 @@ Rectangle {
             f.edits = [];
             n++;
         }
-        var shape = layers.map(l => ({ name: l.name, visible: l.visible, cels: l.cels.map(d => d ? d.key : 0) }));
+        var shape = layers.map(l => ({ name: l.name, visible: l.visible, faded: l.faded, cels: l.cels.map(d => d ? d.key : 0) }));
         storage.sendMessage({ op: "save", dir: storageDir,
                               project: { id: projectId, name: projectName, fps: fps, layers: shape, whole: whole, edits: edits } });
         console.log("[Animator][perf] save handoff", n, "of", all.length, "drawings,", pts, "pts,", Date.now() - t0, "ms");
@@ -283,7 +284,7 @@ Rectangle {
 
     function blankLayers() { return [{ name: "Layer 1", visible: true, cels: [[]] }]; }
 
-    // Replace every layer with the given ones: [{ name, visible, cels: [strokes | null] }]
+    // Replace every layer with the given ones: [{ name, visible, faded, cels: [strokes | null] }]
     function resetLayers(data) {
         loading = true;
         isPlaying = false;
@@ -292,7 +293,7 @@ Rectangle {
         timelineRedo = [];
         currentLayer = 0; // every project has layer 0, so bindings never look past the layers swapped in below
         frameKeys = 0; // keys 1..n, layer by layer, as the storage worker keys a project it loads
-        layers = data.map(dl => ({ name: dl.name, visible: dl.visible, cels: dl.cels.map(s => s ? newDrawing(s) : null) }));
+        layers = data.map(dl => ({ name: dl.name, visible: dl.visible, faded: !!dl.faded, cels: dl.cels.map(s => s ? newDrawing(s) : null) }));
         layerCount = layers.length;
         frameCount = data[0].cels.length;
         current = 0;
@@ -434,7 +435,7 @@ Rectangle {
         if (layers.length >= maxLayers) return;
         var before = timeline(), cels = [newDrawing([])];
         for (var i = 1; i < frameCount; i++) cels.push(null);
-        layers.unshift({ name: "Layer " + (layers.length + 1), visible: true, cels: cels });
+        layers.unshift({ name: "Layer " + (layers.length + 1), visible: true, faded: false, cels: cels });
         layerCount = layers.length;
         currentLayer = 0;
         timelineEdited(before);
@@ -496,8 +497,12 @@ Rectangle {
         historyRev++;
     }
 
+    // The eye: shown, faded (to draw cleanly over a rough pass), hidden
     function toggleLayer(l) {
-        layers[l].visible = !layers[l].visible;
+        var layer = layers[l];
+        if (layer.visible) layer.faded = !layer.faded;
+        layer.visible = !layer.visible || layer.faded;
+        layer.cels.forEach(d => d && d.parts.forEach(p => p.full = true)); // redrawn when next shown
         refreshLayers();
         historyRev++;
     }
@@ -592,6 +597,7 @@ Rectangle {
     function paintFrame(c) {
         var f = frameOf(c), p = f && f.parts.find(p => p.canvas === c), ctx = c.getContext("2d");
         if (!p || !ctx) return;
+        var strength = layers.find(l => l.cels.indexOf(f) >= 0).faded ? layerFade : 0;
         var t0 = Date.now(), drawn = 0, mode = p.full ? "full" : p.dirty ? "area" : "queue";
         ctx.save();
         ctx.translate(-c.x, -c.y); // strokes are in stage coordinates
@@ -605,12 +611,12 @@ Rectangle {
             for (var k = 0; k < f.strokes.length; k++) {
                 var b = bounds(f.strokes[k]), m = b.w / 2;
                 if (b.x1 + m < d.x || b.x0 - m > d.x + d.w || b.y1 + m < d.y || b.y0 - m > d.y + d.h) continue;
-                drawStroke(ctx, f.strokes[k]);
+                drawStroke(ctx, f.strokes[k], strength);
                 drawn++;
             }
             ctx.restore();
         }
-        if (!p.full) for (var q = 0; q < p.queue.length; q++) drawStroke(ctx, p.queue[q]);
+        if (!p.full) for (var q = 0; q < p.queue.length; q++) drawStroke(ctx, p.queue[q], strength);
         drawn += p.queue.length;
         ctx.restore();
         p.full = false;
@@ -632,15 +638,15 @@ Rectangle {
         var ctx = c.getContext("2d");
         if (!ctx || !frameCount) return;
         ctx.clearRect(0, 0, c.width, c.height);
-        var cels = layers[currentLayer].cels, i = current, earlier = [];
+        var cels = layers[currentLayer].cels, i = current, earlier = [], k = layers[currentLayer].faded ? layerFade : 1;
         while (i >= 0 && !cels[i]) i--; // where the drawing on screen starts
         while (--i >= 0 && earlier.length < onionDepth) if (cels[i]) earlier.push(cels[i]);
         for (var back = earlier.length; back >= 1; back--) {
             var f = earlier[back - 1];
-            for (var k = 0; k < f.strokes.length; k++) drawStroke(ctx, f.strokes[k], Math.pow(0.5, back));
+            for (var j = 0; j < f.strokes.length; j++) drawStroke(ctx, f.strokes[j], k * Math.pow(0.5, back));
         }
         var next = cels.slice(current + 1).find(d => d);
-        if (next) for (var n = 0; n < next.strokes.length; n++) drawStroke(ctx, next.strokes[n], 0.5, nextInk);
+        if (next) for (var n = 0; n < next.strokes.length; n++) drawStroke(ctx, next.strokes[n], k * 0.5, nextInk);
     }
 
     // A drawing in miniature (thin lines, every few points), centred in the canvas; pts is either
@@ -724,8 +730,9 @@ Rectangle {
         var t = null, ctx = c.getContext("2d");
         if (live) for (var k in live.tiles) if (live.tiles[k].canvas === c) t = live.tiles[k];
         if (!t || !ctx) return; // after pen-up the frame image has the ink
-        ctx.strokeStyle = live.color;
-        ctx.fillStyle = live.color;
+        var ink = layers[currentLayer].faded ? fade(live.color, layerFade) : live.color;
+        ctx.strokeStyle = ink;
+        ctx.fillStyle = ink;
         ctx.lineCap = "round";
         for (var i = 0; i < t.segs.length; i++) {
             var a = t.segs[i][0], b = t.segs[i][1];
@@ -1088,6 +1095,8 @@ Rectangle {
                 c.moveTo(12, 16); c.lineTo(23, 27); break;
             case "eye-off": c.moveTo(7, 29); c.lineTo(29, 7); // then the eye, struck through
             case "eye":
+            case "eye-half": // a faded eye round a solid pupil: the layer at half strength
+                if (name === "eye-half") { c.arc(18, 18, 5, 0, 2 * Math.PI); c.fill(); c.beginPath(); c.globalAlpha = 0.4; }
                 c.moveTo(4, 18); c.quadraticCurveTo(18, 4, 32, 18); c.quadraticCurveTo(18, 32, 4, 18);
                 c.moveTo(23, 18); c.arc(18, 18, 5, 0, 2 * Math.PI); break;
             case "hold": // a drawing held along the timeline
@@ -1289,7 +1298,10 @@ Rectangle {
                         Btn {
                             palmGuard: true
                             width: 44; height: 52; flat: true
-                            icon: root.historyRev >= 0 && root.layers[index] && root.layers[index].visible ? "eye" : "eye-off"
+                            icon: {
+                                var l = root.historyRev >= 0 && root.layers[index];
+                                return !l || !l.visible ? "eye-off" : l.faded ? "eye-half" : "eye";
+                            }
                             onTap: root.toggleLayer(index)
                         }
                     }
