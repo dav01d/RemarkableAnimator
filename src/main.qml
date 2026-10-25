@@ -136,6 +136,7 @@ Rectangle {
         }
     }
     onIsPlayingChanged: refreshLayers()
+    onFrameCountChanged: if (frameCount < 2) isPlaying = false // one frame doesn't play: "playing" it would lock the pen out
     onOnionDepthChanged: refreshLayers()
 
     Component.onCompleted: {
@@ -471,7 +472,7 @@ Rectangle {
         id: playTimer
         interval: Math.round(1000 / root.fps)
         repeat: true
-        running: root.isPlaying && root.frameCount > 1
+        running: root.isPlaying
         onTriggered: root.current = (root.current + 1) % root.frameCount
     }
 
@@ -1345,7 +1346,11 @@ Rectangle {
 
         Bar {
             Btn { palmGuard: true; icon: "prev"; flat: true; onTap: root.goTo(root.current - 1) }
-            Btn { palmGuard: true; icon: root.isPlaying ? "stop" : "play"; flat: true; on: root.isPlaying; onTap: root.isPlaying = !root.isPlaying }
+            Btn {
+                palmGuard: true; icon: root.isPlaying ? "stop" : "play"; flat: true; on: root.isPlaying
+                enabledLook: root.frameCount > 1
+                onTap: root.isPlaying = !root.isPlaying && root.frameCount > 1
+            }
             Btn { palmGuard: true; icon: "next"; flat: true; onTap: root.goTo(root.current + 1) }
             Btn { palmGuard: true; icon: "new"; flat: true; onTap: root.insertFrame(root.current + 1, null) }
             Btn { palmGuard: true; icon: "copy"; flat: true; onTap: root.insertFrame(root.current + 1, root.frame) }
