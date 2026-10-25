@@ -118,8 +118,8 @@ Rectangle {
 
     // The drawing under the pen: the current layer's at the current frame (its own or a held one)
     readonly property var frame: historyRev >= 0 && current < frameCount ? drawingAt(currentLayer, current) : null
-    readonly property bool canUndo: historyRev >= 0 && !!frame && frame.undo.length > 0
-    readonly property bool canRedo: historyRev >= 0 && !!frame && frame.redo.length > 0
+    readonly property bool canUndo: historyRev >= 0 && (!!frame && frame.undo.length > 0 || timelineUndo.length > 0)
+    readonly property bool canRedo: historyRev >= 0 && (!!frame && frame.redo.length > 0 || timelineRedo.length > 0)
 
     onCurrentChanged: refreshLayers()
     onCurrentLayerChanged: refreshLayers()
@@ -288,6 +288,8 @@ Rectangle {
         loading = true;
         isPlaying = false;
         drawings().forEach(d => d.canvas.destroy());
+        timelineUndo = [];
+        timelineRedo = [];
         currentLayer = 0; // every project has layer 0, so bindings never look past the layers swapped in below
         frameKeys = 0; // keys 1..n, layer by layer, as the storage worker keys a project it loads
         layers = data.map(dl => ({ name: dl.name, visible: dl.visible, cels: dl.cels.map(s => s ? newDrawing(s) : null) }));
@@ -336,9 +338,13 @@ Rectangle {
     // ---------------------------------------------------------------
     function newDrawing(strokes) {
         var d = { key: ++frameKeys, rev: 0, strokes: strokes, undo: [], redo: [], parts: [], trash: [], edits: null };
+        giveCanvas(d);
+        return d;
+    }
+
+    function giveCanvas(d) {
         d.canvas = canvasComp.createObject(stage);
         layoutParts(d);
-        return d;
     }
 
     // Cut the drawing's canvas into parts of frameTile px, each repainted in full
@@ -374,70 +380,118 @@ Rectangle {
 
     // A new frame: a drawing on the current layer (blank or a copy); the other layers hold
     function insertFrame(at, copyFrom) {
+        var before = timeline();
         for (var l = 0; l < layers.length; l++) {
             layers[l].cels.splice(at, 0, l === currentLayer ? newDrawing(copyFrom ? copyFrom.strokes.slice() : []) : null);
             keepFirstDrawing(l);
         }
         frameCount = layers[0].cels.length;
         current = at;
-        refreshLayers();
-        historyRev++;
+        timelineEdited(before);
     }
 
+    // Delete the current layer's drawing here, the reverse of New frame: the layer holds its earlier
+    // drawing instead, and the frame itself goes when no other layer has a drawing of its own here
+    readonly property bool canDeleteFrame: historyRev >= 0 && layerCount > 0 && current < frameCount
+                                           && (!!layers[currentLayer].cels[current] || !layers.some(l => l.cels[current]))
     function deleteFrame() {
         if (frameCount <= 1) { clearFrame(); return; }
-        for (var l = 0; l < layers.length; l++) {
-            var cels = layers[l].cels, d = cels.splice(current, 1)[0];
-            if (!d) continue;
-            if (current < cels.length && !cels[current]) cels[current] = d; // still held in the next frame
-            else d.canvas.destroy();
-            keepFirstDrawing(l);
+        if (!canDeleteFrame) return; // a hold where other layers draw: nothing of this layer's to delete
+        var before = timeline(), cels = layers[currentLayer].cels;
+        if (layers.some((l, i) => i !== currentLayer && l.cels[current])) cels[current] = null;
+        else {
+            layers.forEach(l => l.cels.splice(current, 1));
+            frameCount = layers[0].cels.length;
+            current = Math.min(current, frameCount - 1);
         }
-        frameCount = layers[0].cels.length;
-        current = Math.min(current, frameCount - 1);
-        refreshLayers();
-        historyRev++;
+        if (!cels.some(d => d)) cels[0] = newDrawing([]); // a layer always has a drawing
+        keepFirstDrawing(currentLayer);
+        timelineEdited(before);
     }
 
     function moveFrame(from, to) {
         if (from === to) return;
+        var before = timeline();
         for (var l = 0; l < layers.length; l++) {
             layers[l].cels.splice(to, 0, layers[l].cels.splice(from, 1)[0]);
             keepFirstDrawing(l);
         }
         current = to;
-        refreshLayers();
-        historyRev++; // autosave
+        timelineEdited(before);
     }
 
     // Hold: the current layer keeps showing its earlier drawing here. Draw: a drawing of its own,
     // starting as a copy of the held one.
     function toggleHold() {
-        var cels = layers[currentLayer].cels, d = cels[current];
+        var before = timeline(), cels = layers[currentLayer].cels;
         if (current === 0) return; // a layer always starts with a drawing
-        if (d) { d.canvas.destroy(); cels[current] = null; }
-        else cels[current] = newDrawing(frame.strokes.slice());
-        refreshLayers();
-        historyRev++;
+        cels[current] = cels[current] ? null : newDrawing(frame.strokes.slice());
+        timelineEdited(before);
     }
 
     // A new layer goes on top, with one blank drawing held through the whole animation
     function addLayer() {
         if (layers.length >= maxLayers) return;
-        var cels = [newDrawing([])];
+        var before = timeline(), cels = [newDrawing([])];
         for (var i = 1; i < frameCount; i++) cels.push(null);
         layers.unshift({ name: "Layer " + (layers.length + 1), visible: true, cels: cels });
         layerCount = layers.length;
         currentLayer = 0;
-        refreshLayers();
-        historyRev++;
+        timelineEdited(before);
     }
 
     function deleteLayer(l) {
         if (layers.length <= 1) return;
-        layers.splice(l, 1)[0].cels.forEach(d => d && d.canvas.destroy());
+        var before = timeline();
+        layers.splice(l, 1);
         currentLayer = Math.min(currentLayer, layers.length - 1); // before layerCount, whose bindings index layers by it
         layerCount = layers.length;
+        timelineEdited(before);
+    }
+
+    // Timeline undo: frame and layer edits keep a copy of every layer's drawings as they were, and
+    // Undo takes whichever is newer, the latest of these or the drawing's own last stroke edit. A
+    // drawing that leaves the timeline drops its canvas (they're big) and gets a new one on its return.
+    readonly property int timelineUndoMax: 30
+    property var timelineUndo: []
+    property var timelineRedo: []
+    property int editSeq: 0 // orders stroke and timeline edits for Undo and Redo
+
+    function timeline() {
+        return { layers: layers.map(l => ({ layer: l, cels: l.cels.slice() })), current: current, currentLayer: currentLayer };
+    }
+
+    function timelineEdited(before) {
+        timelineUndo.push({ before: before, after: timeline(), seq: ++editSeq });
+        if (timelineUndo.length > timelineUndoMax) timelineUndo.shift();
+        timelineRedo = [];
+        timelineShown(before);
+    }
+
+    function restoreTimeline(t) {
+        var was = timeline();
+        currentLayer = 0; // every timeline has layer 0, so bindings never look past the layers swapped in
+        layers = t.layers.map(s => { s.layer.cels = s.cels.slice(); return s.layer; });
+        // Drawings back on the timeline get a canvas before anything refreshes the layers; the
+        // storage worker forgot them, so they're saved whole
+        drawings().forEach(d => { if (!d.canvas) { giveCanvas(d); d.edits = null; } });
+        layerCount = layers.length;
+        frameCount = layers[0].cels.length;
+        current = t.current;
+        currentLayer = t.currentLayer;
+        timelineShown(was);
+    }
+
+    // No canvases for drawings that left the timeline since `was`
+    function timelineShown(was) {
+        var now = drawings();
+        was.layers.forEach(s => s.cels.forEach(d => {
+            if (!d || !d.canvas || now.indexOf(d) >= 0) return;
+            dropTrash(d);
+            d.canvas.destroy();
+            d.canvas = null;
+            d.parts = [];
+        }));
         refreshLayers();
         historyRev++;
     }
@@ -695,6 +749,7 @@ Rectangle {
     }
 
     function pushOp(op) {
+        op.seq = ++editSeq;
         frame.undo.push(op);
         frame.redo = [];
         historyRev++;
@@ -707,21 +762,43 @@ Rectangle {
         f.rev++;
     }
 
+    // The drawing's last stroke edit, unless the last timeline edit is newer
+    function latest(ops, timelineOps) {
+        var op = ops.length ? ops[ops.length - 1] : null, t = timelineOps[timelineOps.length - 1];
+        return t && (!op || t.seq > op.seq) ? null : op;
+    }
+
     function undo() {
-        var f = frame, op = f && f.undo.pop();
-        if (!op) return;
+        var f = frame, op = f && latest(f.undo, timelineUndo);
+        if (!op) {
+            var t = timelineUndo.pop();
+            if (!t) return;
+            t.seq = ++editSeq;
+            timelineRedo.push(t);
+            return restoreTimeline(t.before);
+        }
+        f.undo.pop();
         if (op.t === "add") spliceStrokes(f, f.strokes.indexOf(op.s), 1, []);
         else spliceStrokes(f, 0, f.strokes.length, op.before);
+        op.seq = ++editSeq;
         f.redo.push(op);
         repaint(f);
         historyRev++;
     }
 
     function redo() {
-        var f = frame, op = f && f.redo.pop();
-        if (!op) return;
+        var f = frame, op = f && latest(f.redo, timelineRedo);
+        if (!op) {
+            var t = timelineRedo.pop();
+            if (!t) return;
+            t.seq = ++editSeq;
+            timelineUndo.push(t);
+            return restoreTimeline(t.after);
+        }
+        f.redo.pop();
         if (op.t === "add") spliceStrokes(f, f.strokes.length, 0, [op.s]);
         else spliceStrokes(f, 0, f.strokes.length, op.after);
+        op.seq = ++editSeq;
         f.undo.push(op);
         repaint(f);
         historyRev++;
@@ -1362,7 +1439,9 @@ Rectangle {
                 label: armed ? "Sure?" : ""
                 flat: true
                 on: armed
+                enabledLook: root.canDeleteFrame
                 onTap: {
+                    if (!root.canDeleteFrame) return;
                     if (armed) { armed = false; root.deleteFrame(); }
                     else { armed = true; disarm.restart(); }
                 }
