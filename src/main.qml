@@ -69,6 +69,9 @@ Rectangle {
             root.penPressure = v[0] / 1000;
             root.penEraser = v[3] === "1";
             if (root.penEraser && root.live) root.liveToEraser();
+            // On the reMarkable 2 the pen's release can arrive looking like a palm's, which the
+            // canvas refuses; the pen leaving the glass ends the stroke instead
+            if (root.isRm2 && v[4] === "0" && (root.live || root.liveErasing)) root.endGesture();
         }
     }
 
@@ -773,6 +776,7 @@ Rectangle {
     // ---------------------------------------------------------------
     function beginGesture(pt, eraserEnd) {
         if (isPlaying || showExportModal || !frame) return;
+        if (live || liveErasing) endGesture(); // its release never came: keep it, don't orphan its tiles
         var x = pt.position.x, y = pt.position.y;
         if (eraserEnd) {
             liveErasing = true;
