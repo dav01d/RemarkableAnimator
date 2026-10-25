@@ -60,16 +60,19 @@ Rectangle {
     readonly property bool isRm2: Math.min(Screen.width, Screen.height) === 1404 // its panel's short side (Paper Pro 1620, Move 954)
 
     // reMarkable 2: the animator-ink xovi extension, when installed, inks the pen's trace through
-    // xochitl's own fast pen path while this heartbeat says the canvas is up ("on x y w h size",
-    // screen px). It counts a heartbeat older than 3 s as off.
-    readonly property bool inkArmed: isRm2 && !!frame && !isPlaying && !showExportModal && !showProjects && !showRename && !eraserTool
+    // xochitl's own fast pen path while this heartbeat says the canvas is up ("on x y w h size
+    // eraserTool eraseRadius", screen px), and whites out the eraser's path the same way. It counts
+    // a heartbeat older than 3 s as off.
+    readonly property bool inkArmed: isRm2 && !!frame && !isPlaying && !showExportModal && !showProjects && !showRename
     function armInk(on) {
         var p = stage.mapToItem(null, 0, 0), xhr = new XMLHttpRequest();
         xhr.open("PUT", "file:///tmp/animator-ink");
-        xhr.send(on ? ["on", Math.round(p.x), Math.round(p.y), Math.round(stage.width), Math.round(stage.height), sizes[sizeIndex]].join(" ") : "off");
+        xhr.send(on ? ["on", Math.round(p.x), Math.round(p.y), Math.round(stage.width), Math.round(stage.height), sizes[sizeIndex],
+                       eraserTool ? 1 : 0, eraseRadius].join(" ") : "off");
     }
     onInkArmedChanged: armInk(inkArmed)
     onSizeIndexChanged: if (inkArmed) armInk(true)
+    onEraserToolChanged: if (inkArmed) armInk(true)
     Timer { interval: 1000; repeat: true; running: root.inkArmed; onTriggered: root.armInk(true) }
 
     AppLoad {
@@ -96,6 +99,7 @@ Rectangle {
     readonly property int frameTile: isRm2 ? 400 : 100000 // px: parts of a drawing's baked ink (one part off the rM2)
     readonly property int minStep: isRm2 ? 4 : 2 // px between stroke points: half the points on the slower reMarkable 2
     readonly property int eraseRun: 32 // points the eraser skips at once when their box is out of its reach
+    readonly property int eraseRadius: 16 // px: the eraser rubs out points this close to its path (plus their half width)
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
     property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
@@ -796,7 +800,7 @@ Rectangle {
     // One pass per pen move, each point measured once against the whole path: a long scribble
     // is thousands of points, too many to re-check every few pixels on the reMarkable 2
     function eraseAlong(x0, y0, x, y) {
-        var R = 16, strokes = frame.strokes, hitAny = false;
+        var R = eraseRadius, strokes = frame.strokes, hitAny = false;
         var dx = x - x0, dy = y - y0, len2 = dx * dx + dy * dy;
         var minX = Math.min(x0, x), maxX = Math.max(x0, x), minY = Math.min(y0, y), maxY = Math.max(y0, y);
         for (var i = strokes.length - 1; i >= 0; i--) {
@@ -845,7 +849,7 @@ Rectangle {
         var x = pt.position.x, y = pt.position.y;
         if (eraserEnd) {
             liveErasing = true;
-            eraseOp = { x: x, y: y, before: frame.strokes.slice(), hit: false };
+            eraseOp = { x: x, y: y, before: frame.strokes.slice(), hit: false, x0: x, y0: y, x1: x, y1: y };
             eraseAlong(x, y, x, y);
             return;
         }
@@ -879,6 +883,8 @@ Rectangle {
             // Erase along the whole path since the last move so fast swipes don't skip strokes
             eraseAlong(eraseOp.x, eraseOp.y, x, y);
             eraseOp.x = x; eraseOp.y = y;
+            eraseOp.x0 = Math.min(eraseOp.x0, x); eraseOp.x1 = Math.max(eraseOp.x1, x);
+            eraseOp.y0 = Math.min(eraseOp.y0, y); eraseOp.y1 = Math.max(eraseOp.y1, y);
             return;
         }
         if (!live) return;
@@ -893,6 +899,11 @@ Rectangle {
     function endGesture() {
         if (liveErasing) console.log("[Animator][perf] erase", eraseOp.ev || 0, "moves,", eraseOp.ms || 0, "ms JS");
         if (liveErasing && eraseOp.hit) pushOp({ t: "swap", before: eraseOp.before, after: frame.strokes.slice() });
+        if (liveErasing && isRm2) { // the animator-ink extension whited the whole path, other layers' ink too: draw it again
+            var pad = eraseRadius + 4;
+            refreshPatch.x = eraseOp.x0 - pad; refreshPatch.y = eraseOp.y0 - pad;
+            refreshPatch.width = eraseOp.x1 - eraseOp.x0 + 2 * pad; refreshPatch.height = eraseOp.y1 - eraseOp.y0 + 2 * pad;
+        }
         if (live) {
             var f = frame, s = { tool: live.tool, color: live.color, pts: live.pts };
             spliceStrokes(f, f.strokes.length, 0, [s]);
@@ -1124,6 +1135,8 @@ Rectangle {
                 onVisibleChanged: if (visible) requestPaint()
                 onPaint: root.paintOnion(this)
             }
+            // Paper under everything: moving it makes Qt draw its old and new area again
+            Rectangle { id: refreshPatch; z: -2; color: root.color; visible: root.isRm2; width: 0; height: 0 }
         }
         Item { id: liveLayer; anchors.fill: parent; z: 1 } // pen preview above the frames
 
