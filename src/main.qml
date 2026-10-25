@@ -284,6 +284,7 @@ Rectangle {
             renderStrategy: Canvas.Immediate
             onWidthChanged: root.repaint(root.frameOf(this))
             onHeightChanged: root.repaint(root.frameOf(this))
+            onAvailableChanged: if (available) requestPaint() // a paint asked for before it was ready did nothing
             onPaint: root.paintFrame(this)
         }
     }
@@ -417,6 +418,7 @@ Rectangle {
                 d.canvas.z = -0.1 * l; // upper layers on top, all above the onion skin
                 d.canvas.visible = d === shown;
                 if (d.canvas.visible && (d.full || d.queue.length)) d.canvas.requestPaint();
+                else if (!d.canvas.visible) dropTrash(d); // unbaked ink would float over other frames
             }
         }
         onionCanvas.requestPaint();
@@ -468,6 +470,12 @@ Rectangle {
         f.canvas.markDirty(Qt.rect(b.x0 - b.w, b.y0 - b.w, b.x1 - b.x0 + 2 * b.w, b.y1 - b.y0 + 2 * b.w));
     }
 
+    // The live tiles of strokes not baked yet
+    function dropTrash(f) {
+        for (var j = 0; j < f.trash.length; j++) f.trash[j].destroy();
+        f.trash = [];
+    }
+
     // Looked up rather than stored on the Canvas: a JS object assigned to a QML
     // property is copied, so the Canvas would see a stale snapshot
     function frameOf(c) {
@@ -507,8 +515,7 @@ Rectangle {
         f.dirty = null;
         f.queue = [];
         // The ink is on the image now, so the live preview dots can go
-        for (var j = 0; j < f.trash.length; j++) f.trash[j].destroy();
-        f.trash = [];
+        dropTrash(f);
         var ms = Date.now() - t0;
         if (ms > 10) console.log("[Animator][perf] paint", mode, drawn, "strokes", ms, "ms");
     }
