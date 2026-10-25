@@ -57,6 +57,7 @@ Rectangle {
     // as a plain mouse, so pressure, tilt and the eraser end come from evdev instead
     property real penPressure: 0        // 0..1, 0 = no backend data yet
     property bool penEraser: false
+    readonly property bool isRm2: Math.min(Screen.width, Screen.height) === 1404 // its panel's short side (Paper Pro 1620, Move 954)
 
     AppLoad {
         id: penBackend
@@ -77,25 +78,6 @@ Rectangle {
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
     property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
-    property int canvasMethod: DisplayMethodArea.UFast // the canvas waveform between strokes (see its DisplayMethodArea)
-    property int settleMs: 700          // pen rest before the Fast pass, and how long a pass lasts
-
-    // A full refresh now for a new picture (frame change, undo): ink drawn on UFast leaves the
-    // panel out of step, and only a full refresh repaints it truly. New ink gets a calm Fast pass
-    // once the pen has rested.
-    function settle(now) {
-        if (now) canvasMethod = DisplayMethodArea.Content;
-        settleTimer.restart();
-    }
-    Timer {
-        id: settleTimer
-        interval: root.settleMs
-        onTriggered: {
-            if (root.live || root.liveErasing) return; // the pen's back: try again at pen-up
-            if (root.canvasMethod !== DisplayMethodArea.UFast) root.canvasMethod = DisplayMethodArea.UFast;
-            else { root.canvasMethod = DisplayMethodArea.Fast; restart(); }
-        }
-    }
 
     // Export
     property string statusMessage: ""
@@ -437,7 +419,7 @@ Rectangle {
             }
         }
         onionCanvas.requestPaint();
-        settle(true);
+        console.log("[Animator][perf] frame", current, "live items", liveLayer.children.length, "rM2", isRm2, Screen.width + "x" + Screen.height);
     }
 
     Timer {
@@ -455,7 +437,6 @@ Rectangle {
         if (!f || !f.canvas) return;
         f.full = true;
         f.canvas.requestPaint();
-        settle(true);
     }
 
     // Redraw only one area (the eraser's footprint): much less drawing, and the e-ink
@@ -822,7 +803,6 @@ Rectangle {
         moveWaiting = 0;
         eraseOp = null;
         liveErasing = false;
-        settle(false);
     }
 
     // ---------------------------------------------------------------
@@ -1041,14 +1021,14 @@ Rectangle {
         }
         Item { id: liveLayer; anchors.fill: parent; z: 1 } // pen preview above the frames
 
-        // Tell xochitl which e-ink waveform to use for this region. UFast puts new ink on the panel
-        // noticeably sooner, but it's 1-bit and doesn't clear old ink. A switch repaints the whole
-        // canvas (~200 ms on the reMarkable 2), so it never happens at pen-down: the canvas waits
-        // on UFast, with passes while the pen rests (see settle). Erasing needs Fast to clear.
+        // Tell xochitl which e-ink waveform to use for this region. UFast puts the live stroke
+        // (and the eraser's gaps) on the panel noticeably sooner; it's 1-bit, so grey ink settles when Fast takes over.
+        // Not on the reMarkable 2: there a switch repaints the whole canvas in software (~200 ms
+        // before each stroke shows), and switching often leaves the panel out of step with the app
         DisplayMethodArea {
             anchors.fill: parent
             displayMethod: root.isPlaying ? DisplayMethodArea.Animate
-                         : root.liveErasing ? DisplayMethodArea.Fast : root.canvasMethod
+                         : (root.live || root.liveErasing) && !root.isRm2 ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
         }
 
         // The Marker reaches AppLoad apps as plain (non-synthesized) mouse events. Fingers
