@@ -483,9 +483,9 @@ Rectangle {
 
     // The parts of drawing f that overlap r (stage coordinates)
     function partsIn(f, r) {
-        return f.parts.filter(p => r.x < p.canvas.x + p.canvas.width && r.x + r.w > p.canvas.x
-                                   && r.y < p.canvas.y + p.canvas.height && r.y + r.h > p.canvas.y);
+        return f.parts.filter(p => overlaps(p.canvas, r));
     }
+    function overlaps(c, r) { return r.x < c.x + c.width && r.x + r.w > c.x && r.y < c.y + c.height && r.y + r.h > c.y; }
     function pending(p) { return p.full || p.dirty || p.queue.length; }
     function markPart(p, r) { p.canvas.markDirty(Qt.rect(r.x - p.canvas.x, r.y - p.canvas.y, r.w, r.h)); }
     function strokeRect(s) {
@@ -545,6 +545,9 @@ Rectangle {
         p.full = false;
         p.dirty = null;
         p.queue = [];
+        // A part without ink stays hidden, so changing frames redraws only where there's ink
+        // (on the reMarkable 2 the panel update's cost grows with its area)
+        c.visible = f.strokes.some(s => overlaps(c, strokeRect(s)));
         // The ink is on the image now, so the live preview dots can go
         if (!f.parts.some(pending)) dropTrash(f);
         var ms = Date.now() - t0;
