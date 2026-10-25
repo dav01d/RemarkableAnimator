@@ -75,6 +75,7 @@ Rectangle {
     // Live gesture
     property var live: null             // stroke being drawn, plus tiles: { "col,row": { canvas, segs } }
     property int liveTile: 128          // px: size of the Canvas tiles the live stroke is drawn into
+    readonly property int frameTile: isRm2 ? 400 : 100000 // px: parts of a drawing's baked ink (one part off the rM2)
     readonly property int minStep: isRm2 ? 4 : 2 // px between stroke points: half the points on the slower reMarkable 2
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
@@ -275,15 +276,22 @@ Rectangle {
         loading = false;
     }
 
-    // One drawing's baked ink
+    // One drawing's baked ink, in Canvas parts so a new stroke repaints only the parts it touches:
+    // on the reMarkable 2 a repainted Canvas goes to the panel whole, and the next stroke waits
+    // for it. Elsewhere one part covers the stage (frameTile).
     Component {
         id: canvasComp
-        Canvas {
+        Item {
             anchors.fill: parent
+            onWidthChanged: root.layoutParts(root.frameOf(this))
+            onHeightChanged: root.layoutParts(root.frameOf(this))
+        }
+    }
+    Component {
+        id: partComp
+        Canvas {
             renderTarget: Canvas.Image
             renderStrategy: Canvas.Immediate
-            onWidthChanged: root.repaint(root.frameOf(this))
-            onHeightChanged: root.repaint(root.frameOf(this))
             onAvailableChanged: if (available) requestPaint() // a paint asked for before it was ready did nothing
             onPaint: root.paintFrame(this)
         }
@@ -304,9 +312,22 @@ Rectangle {
     // FRAMES
     // ---------------------------------------------------------------
     function newDrawing(strokes) {
-        var d = { key: ++frameKeys, rev: 0, strokes: strokes, undo: [], redo: [], queue: [], full: true, trash: [], edits: null };
+        var d = { key: ++frameKeys, rev: 0, strokes: strokes, undo: [], redo: [], parts: [], trash: [], edits: null };
         d.canvas = canvasComp.createObject(stage);
+        layoutParts(d);
         return d;
+    }
+
+    // Cut the drawing's canvas into parts of frameTile px, each repainted in full
+    function layoutParts(f) {
+        if (!f) return;
+        f.parts.forEach(p => p.canvas.destroy());
+        var c = f.canvas, T = frameTile;
+        f.parts = [];
+        for (var y = 0; y < c.height; y += T)
+            for (var x = 0; x < c.width; x += T)
+                f.parts.push({ canvas: partComp.createObject(c, { x: x, y: y, width: Math.min(T, c.width - x), height: Math.min(T, c.height - y) }),
+                               full: true, dirty: null, queue: [] });
     }
 
     // A layer always starts with a drawing: if its first frame became a hold, its first drawing moves there
@@ -417,8 +438,8 @@ Rectangle {
                 if (!d) continue;
                 d.canvas.z = -0.1 * l; // upper layers on top, all above the onion skin
                 d.canvas.visible = d === shown;
-                if (d.canvas.visible && (d.full || d.queue.length)) d.canvas.requestPaint();
-                else if (!d.canvas.visible) dropTrash(d); // unbaked ink would float over other frames
+                if (d.canvas.visible) d.parts.forEach(p => { if (pending(p)) p.canvas.requestPaint(); });
+                else dropTrash(d); // unbaked ink would float over other frames
             }
         }
         onionCanvas.requestPaint();
@@ -438,8 +459,7 @@ Rectangle {
     // ---------------------------------------------------------------
     function repaint(f) {
         if (!f || !f.canvas) return;
-        f.full = true;
-        f.canvas.requestPaint();
+        f.parts.forEach(p => { p.full = true; p.canvas.requestPaint(); });
     }
 
     // Redraw only one area (the eraser's footprint): much less drawing, and the e-ink
@@ -448,14 +468,24 @@ Rectangle {
         if (!f || !f.canvas) return;
         // Strokes still waiting to be drawn may have just been erased; drop the stale
         // copies and redraw their area from the current stroke list instead
-        for (var i = 0; i < f.queue.length; i++) {
-            var b = bounds(f.queue[i]);
-            r = unite(r, { x: b.x0 - b.w, y: b.y0 - b.w, w: b.x1 - b.x0 + 2 * b.w, h: b.y1 - b.y0 + 2 * b.w });
+        for (var p of f.parts) {
+            for (var s of p.queue) p.dirty = p.dirty ? unite(p.dirty, strokeRect(s)) : strokeRect(s);
+            p.queue = [];
         }
-        f.queue = [];
-        if (f.dirty) r = unite(f.dirty, r);
-        f.dirty = r;
-        f.canvas.markDirty(Qt.rect(r.x, r.y, r.w, r.h));
+        for (p of partsIn(f, r)) p.dirty = p.dirty ? unite(p.dirty, r) : r;
+        for (p of f.parts) if (p.dirty) markPart(p, p.dirty);
+    }
+
+    // The parts of drawing f that overlap r (stage coordinates)
+    function partsIn(f, r) {
+        return f.parts.filter(p => r.x < p.canvas.x + p.canvas.width && r.x + r.w > p.canvas.x
+                                   && r.y < p.canvas.y + p.canvas.height && r.y + r.h > p.canvas.y);
+    }
+    function pending(p) { return p.full || p.dirty || p.queue.length; }
+    function markPart(p, r) { p.canvas.markDirty(Qt.rect(r.x - p.canvas.x, r.y - p.canvas.y, r.w, r.h)); }
+    function strokeRect(s) {
+        var b = bounds(s);
+        return { x: b.x0 - b.w, y: b.y0 - b.w, w: b.x1 - b.x0 + 2 * b.w, h: b.y1 - b.y0 + 2 * b.w };
     }
 
     function unite(a, b) {
@@ -465,9 +495,8 @@ Rectangle {
 
     // Queue a stroke to be drawn onto the frame image, updating only its own area
     function queueStroke(f, s) {
-        var b = bounds(s);
-        f.queue.push(s);
-        f.canvas.markDirty(Qt.rect(b.x0 - b.w, b.y0 - b.w, b.x1 - b.x0 + 2 * b.w, b.y1 - b.y0 + 2 * b.w));
+        var r = strokeRect(s);
+        for (var p of partsIn(f, r)) { p.queue.push(s); markPart(p, r); }
     }
 
     // The live tiles of strokes not baked yet
@@ -479,43 +508,40 @@ Rectangle {
     // Looked up rather than stored on the Canvas: a JS object assigned to a QML
     // property is copied, so the Canvas would see a stale snapshot
     function frameOf(c) {
-        return drawings().find(d => d.canvas === c) || null;
+        return drawings().find(d => d.canvas === c || d.canvas === c.parent) || null; // a drawing, or one of its parts
     }
 
-    // Draws onto the frame's image: everything after undo/clear, only the dirty area after
-    // an erase, then any newly queued strokes
+    // Draws onto one part of the frame's image: everything after undo/clear, only the dirty
+    // area after an erase, then any newly queued strokes
     function paintFrame(c) {
-        var f = frameOf(c), ctx = c.getContext("2d");
-        if (!f || !ctx) return;
-        var t0 = Date.now(), drawn = 0, mode = f.full ? "full" : f.dirty ? "area" : "queue";
-        if (f.full) {
-            ctx.clearRect(0, 0, c.width, c.height);
-            for (var i = 0; i < f.strokes.length; i++) drawStroke(ctx, f.strokes[i]);
-            drawn = f.strokes.length;
-        } else {
-            var d = f.dirty;
-            if (d) {
-                ctx.save();
-                ctx.beginPath();
-                ctx.rect(d.x, d.y, d.w, d.h);
-                ctx.clip();
-                ctx.clearRect(d.x, d.y, d.w, d.h);
-                for (var k = 0; k < f.strokes.length; k++) {
-                    var b = bounds(f.strokes[k]), m = b.w / 2;
-                    if (b.x1 + m < d.x || b.x0 - m > d.x + d.w || b.y1 + m < d.y || b.y0 - m > d.y + d.h) continue;
-                    drawStroke(ctx, f.strokes[k]);
-                    drawn++;
-                }
-                ctx.restore();
+        var f = frameOf(c), p = f && f.parts.find(p => p.canvas === c), ctx = c.getContext("2d");
+        if (!p || !ctx) return;
+        var t0 = Date.now(), drawn = 0, mode = p.full ? "full" : p.dirty ? "area" : "queue";
+        ctx.save();
+        ctx.translate(-c.x, -c.y); // strokes are in stage coordinates
+        var d = p.full ? { x: c.x, y: c.y, w: c.width, h: c.height } : p.dirty;
+        if (d) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(d.x, d.y, d.w, d.h);
+            ctx.clip();
+            ctx.clearRect(d.x, d.y, d.w, d.h);
+            for (var k = 0; k < f.strokes.length; k++) {
+                var b = bounds(f.strokes[k]), m = b.w / 2;
+                if (b.x1 + m < d.x || b.x0 - m > d.x + d.w || b.y1 + m < d.y || b.y0 - m > d.y + d.h) continue;
+                drawStroke(ctx, f.strokes[k]);
+                drawn++;
             }
-            for (var q = 0; q < f.queue.length; q++) drawStroke(ctx, f.queue[q]);
-            drawn += f.queue.length;
+            ctx.restore();
         }
-        f.full = false;
-        f.dirty = null;
-        f.queue = [];
+        if (!p.full) for (var q = 0; q < p.queue.length; q++) drawStroke(ctx, p.queue[q]);
+        drawn += p.queue.length;
+        ctx.restore();
+        p.full = false;
+        p.dirty = null;
+        p.queue = [];
         // The ink is on the image now, so the live preview dots can go
-        dropTrash(f);
+        if (!f.parts.some(pending)) dropTrash(f);
         var ms = Date.now() - t0;
         if (ms > 10) console.log("[Animator][perf] paint", mode, drawn, "strokes", ms, "ms");
     }
