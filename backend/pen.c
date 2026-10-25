@@ -30,6 +30,8 @@
 #define MSG_TERMINATE 0xFFFFFFFFu
 #define MIN_INTERVAL_MS 15
 #define MIN_PRESSURE_STEP 15 // of 1000: AppLoad logs every message, so send only real changes
+#define CONNECT_TRIES 100    // with CONNECT_RETRY_MS: wait up to 5 s for AppLoad's socket
+#define CONNECT_RETRY_MS 50
 
 static int send_msg(int fd, uint32_t type, const char *text) {
     if (fd < 0) return printf("%u: %s\n", type, text) < 0 ? -1 : fflush(stdout); // --print mode
@@ -83,7 +85,11 @@ int main(int argc, char **argv) {
         sock = socket(AF_UNIX, SOCK_SEQPACKET, 0);
         struct sockaddr_un addr = { .sun_family = AF_UNIX };
         strncpy(addr.sun_path, argv[1], sizeof addr.sun_path - 1);
-        if (sock < 0 || connect(sock, (struct sockaddr *)&addr, sizeof addr) < 0) { perror("[pen] connect"); return 1; }
+        // AppLoad can start us before its socket exists: keep trying for a while
+        int tries = 0;
+        while (sock >= 0 && connect(sock, (struct sockaddr *)&addr, sizeof addr) < 0 && ++tries < CONNECT_TRIES)
+            usleep(CONNECT_RETRY_MS * 1000);
+        if (sock < 0 || tries == CONNECT_TRIES) { perror("[pen] connect"); return 1; }
     }
 
     int pen = open_pen();
