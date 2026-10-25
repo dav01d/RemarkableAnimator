@@ -70,6 +70,12 @@ About 20 minutes the first time. You'll: back up, turn on Developer Mode (Paper 
 the two community tools that let the tablet run apps (XOVI and AppLoad), then copy Animator over.
 **Already have XOVI and AppLoad?** Skip to [step 4](#4-install-animator).
 
+| | Paper Pro Move | reMarkable 2 |
+|---|---|---|
+| Software version | 3.28 | 3.29.0.153 |
+| Step 2, Developer Mode | Yes (it resets the tablet) | Skip it |
+| Pen booster | Not needed | Step 4 installs it for you |
+
 ### 1. Back up your tablet
 Let the tablet finish syncing, then check on [my.remarkable.com](https://my.remarkable.com) or in
 the reMarkable desktop app that every notebook you care about is there. Anything that isn't will be

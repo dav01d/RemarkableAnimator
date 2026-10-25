@@ -287,12 +287,10 @@ Rectangle {
         loading = true;
         isPlaying = false;
         drawings().forEach(d => d.canvas.destroy());
-        layers = [];
+        currentLayer = 0; // every project has layer 0, so bindings never look past the layers swapped in below
         frameKeys = 0; // keys 1..n, layer by layer, as the storage worker keys a project it loads
-        for (var l = 0; l < data.length; l++)
-            layers.push({ name: data[l].name, visible: data[l].visible, cels: data[l].cels.map(s => s ? newDrawing(s) : null) });
+        layers = data.map(dl => ({ name: dl.name, visible: dl.visible, cels: dl.cels.map(s => s ? newDrawing(s) : null) }));
         layerCount = layers.length;
-        currentLayer = 0;
         frameCount = data[0].cels.length;
         current = 0;
         refreshLayers();
@@ -437,8 +435,8 @@ Rectangle {
     function deleteLayer(l) {
         if (layers.length <= 1) return;
         layers.splice(l, 1)[0].cels.forEach(d => d && d.canvas.destroy());
+        currentLayer = Math.min(currentLayer, layers.length - 1); // before layerCount, whose bindings index layers by it
         layerCount = layers.length;
-        currentLayer = Math.min(currentLayer, layerCount - 1);
         refreshLayers();
         historyRev++;
     }
