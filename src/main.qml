@@ -95,6 +95,7 @@ Rectangle {
     readonly property int liveTile: isRm2 ? 64 : 128
     readonly property int frameTile: isRm2 ? 400 : 100000 // px: parts of a drawing's baked ink (one part off the rM2)
     readonly property int minStep: isRm2 ? 4 : 2 // px between stroke points: half the points on the slower reMarkable 2
+    readonly property int eraseRun: 32 // points the eraser skips at once when their box is out of its reach
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
     property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
@@ -747,6 +748,25 @@ Rectangle {
         return s.box;
     }
 
+    // A stroke's points in runs of eraseRun, each with its own box, so the eraser looks only at
+    // the runs it's near (a long scribble is near on most moves but touched on few)
+    function runsOf(s) {
+        var b = bounds(s);
+        if (!b.runs) {
+            b.runs = [];
+            for (var i = 0; i < s.pts.length; i += eraseRun) {
+                var u = { i0: i, i1: Math.min(i + eraseRun, s.pts.length), x0: 1e9, y0: 1e9, x1: -1e9, y1: -1e9 };
+                for (var j = u.i0; j < u.i1; j++) {
+                    var p = s.pts[j];
+                    u.x0 = Math.min(u.x0, p.x); u.x1 = Math.max(u.x1, p.x);
+                    u.y0 = Math.min(u.y0, p.y); u.y1 = Math.max(u.y1, p.y);
+                }
+                b.runs.push(u);
+            }
+        }
+        return b.runs;
+    }
+
     // Rub out only what the eraser covered moving from (x0, y0) to (x, y): drop the covered
     // points and split the stroke into the pieces that remain (like the notebook app's eraser).
     // One pass per pen move, each point measured once against the whole path: a long scribble
@@ -760,10 +780,14 @@ Rectangle {
             if (maxX < b.x0 - reach || minX > b.x1 + reach || maxY < b.y0 - reach || minY > b.y1 + reach) continue;
             // Find the covered points first: a big stroke is near the eraser on most moves but
             // touched on few, and copying its points every time made erasing crawl
-            var cut = [];
-            for (var j = 0; j < s.pts.length; j++) {
-                var p = s.pts[j], r = R + p.w / 2;
-                if (p.x > minX - r && p.x < maxX + r && p.y > minY - r && p.y < maxY + r && nearPath(p.x - x0, p.y - y0, dx, dy, len2, r)) cut.push(j);
+            var cut = [], runs = runsOf(s);
+            for (var q = 0; q < runs.length; q++) {
+                var u = runs[q];
+                if (maxX < u.x0 - reach || minX > u.x1 + reach || maxY < u.y0 - reach || minY > u.y1 + reach) continue;
+                for (var j = u.i0; j < u.i1; j++) {
+                    var p = s.pts[j], r = R + p.w / 2;
+                    if (p.x > minX - r && p.x < maxX + r && p.y > minY - r && p.y < maxY + r && nearPath(p.x - x0, p.y - y0, dx, dy, len2, r)) cut.push(j);
+                }
             }
             if (!cut.length) continue;
             cut.push(s.pts.length);
