@@ -1,10 +1,12 @@
 # RemarkableAnimator
 
-AppLoad app for the reMarkable Paper Pro Move. Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+AppLoad app for the reMarkable Paper Pro Move and the reMarkable 2. Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 first: the tablet's renderer and input behave unlike desktop Qt, and most bugs come from that.
 
-- **Build**: `src/backend/entry` from `backend/pen.c` + `share.c` (zig cc, aarch64-linux-musl, static) and
-  `src/resources.rcc` from `src/resources.qrc` (rcc --binary). Rebuild both before deploying.
+- **Build**: `src/backend/{aarch64,armv7l}/entry` from `backend/pen.c` + `share.c` (zig cc, static
+  musl), `src/extension/animator-ink.so` (the rM2 XOVI extension) and `src/resources.rcc` from
+  `src/resources.qrc` (rcc --binary). The README has the exact commands. Rebuild before deploying.
+- **reMarkable 2 changes** are gated by `isRm2` in `main.qml`: keep the Paper Pro's behaviour as it is.
 - **Deploy**: AppLoad caches the app until xochitl restarts, so reopening it runs the old code.
   Close the app, then `deploy.ps1 -Restart`. Don't restart xochitl while the app is open (it can
   crash and reboot the tablet).

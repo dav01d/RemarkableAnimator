@@ -15,7 +15,7 @@ Rectangle {
 
     // AppLoad contract: emit close() to exit, unloading() is called on teardown
     signal close
-    function unloading() { playTimer.stop(); saveProject(); penBackend.terminate(); } // stop the pen backend too
+    function unloading() { playTimer.stop(); saveProject(); penBackend.terminate(); if (isRm2) armInk(false); } // stop the pen backend too
 
     // ---------------------------------------------------------------
     // MODEL
@@ -50,13 +50,30 @@ Rectangle {
     property int onionDepth: 2          // how many previous frames show through (0 = off)
     readonly property string nextInk: "#2060c0" // the next drawing's onion skin (blue on colour panels)
     property var fpsOptions: [6, 8, 12, 24]
-    property int fpsIndex: 2
+    property int fpsIndex: isRm2 ? 0 : 2 // 6 fps on the reMarkable 2: its panel plays faster ones unevenly
     readonly property int fps: fpsOptions[fpsIndex]
 
     // Pen state streamed by the backend (backend/pen.c): xochitl gives apps the Marker
     // as a plain mouse, so pressure, tilt and the eraser end come from evdev instead
     property real penPressure: 0        // 0..1, 0 = no backend data yet
     property bool penEraser: false
+    readonly property bool isRm2: Math.min(Screen.width, Screen.height) === 1404 // its panel's short side (Paper Pro 1620, Move 954)
+
+    // reMarkable 2: the animator-ink xovi extension, when installed, inks the pen's trace through
+    // xochitl's own fast pen path while this heartbeat says the canvas is up ("on x y w h size
+    // eraserTool eraseRadius", screen px), and whites out the eraser's path the same way. It counts
+    // a heartbeat older than 3 s as off.
+    readonly property bool inkArmed: isRm2 && !!frame && !isPlaying && !showExportModal && !showProjects && !showRename
+    function armInk(on) {
+        var p = stage.mapToItem(null, 0, 0), xhr = new XMLHttpRequest();
+        xhr.open("PUT", "file:///tmp/animator-ink");
+        xhr.send(on ? ["on", Math.round(p.x), Math.round(p.y), Math.round(stage.width), Math.round(stage.height), sizes[sizeIndex],
+                       eraserTool ? 1 : 0, eraseRadius].join(" ") : "off");
+    }
+    onInkArmedChanged: armInk(inkArmed)
+    onSizeIndexChanged: if (inkArmed) armInk(true)
+    onEraserToolChanged: if (inkArmed) armInk(true)
+    Timer { interval: 1000; repeat: true; running: root.inkArmed; onTriggered: root.armInk(true) }
 
     AppLoad {
         id: penBackend
@@ -67,12 +84,22 @@ Rectangle {
             var v = contents.split(" "); // "pressure tiltX tiltY eraser touching"
             root.penPressure = v[0] / 1000;
             root.penEraser = v[3] === "1";
+            if (root.penEraser && root.live) root.liveToEraser();
+            // On the reMarkable 2 the pen's release can arrive looking like a palm's, which the
+            // canvas refuses; the pen leaving the glass ends the stroke instead
+            if (root.isRm2 && v[4] === "0" && (root.live || root.liveErasing)) root.endGesture();
         }
     }
 
     // Live gesture
     property var live: null             // stroke being drawn, plus tiles: { "col,row": { canvas, segs } }
-    property int liveTile: 128          // px: size of the Canvas tiles the live stroke is drawn into
+    // px: size of the Canvas tiles the live stroke is drawn into. Smaller on the reMarkable 2: its
+    // panel updates cost more the bigger they are, and wait for overlapping ones still running
+    readonly property int liveTile: isRm2 ? 64 : 128
+    readonly property int frameTile: isRm2 ? 400 : 100000 // px: parts of a drawing's baked ink (one part off the rM2)
+    readonly property int minStep: isRm2 ? 4 : 2 // px between stroke points: half the points on the slower reMarkable 2
+    readonly property int eraseRun: 32 // points the eraser skips at once when their box is out of its reach
+    readonly property int eraseRadius: 16 // px: the eraser rubs out points this close to its path (plus their half width)
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
     property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
@@ -247,6 +274,7 @@ Rectangle {
         projectName = p.name;
         var fi = fpsOptions.indexOf(p.fps);
         if (fi >= 0) fpsIndex = fi;
+        else if (isRm2) fpsIndex = 0; // a new project starts at 6 fps there
         resetLayers(p.length ? p.layers : blankLayers());
         if (p.length) drawings().forEach(d => d.edits = []); // the storage worker kept them
         saveProject(); // marks it most recent, so it reopens next launch
@@ -259,12 +287,10 @@ Rectangle {
         loading = true;
         isPlaying = false;
         drawings().forEach(d => d.canvas.destroy());
-        layers = [];
+        currentLayer = 0; // every project has layer 0, so bindings never look past the layers swapped in below
         frameKeys = 0; // keys 1..n, layer by layer, as the storage worker keys a project it loads
-        for (var l = 0; l < data.length; l++)
-            layers.push({ name: data[l].name, visible: data[l].visible, cels: data[l].cels.map(s => s ? newDrawing(s) : null) });
+        layers = data.map(dl => ({ name: dl.name, visible: dl.visible, cels: dl.cels.map(s => s ? newDrawing(s) : null) }));
         layerCount = layers.length;
-        currentLayer = 0;
         frameCount = data[0].cels.length;
         current = 0;
         refreshLayers();
@@ -272,15 +298,23 @@ Rectangle {
         loading = false;
     }
 
-    // One drawing's baked ink
+    // One drawing's baked ink, in Canvas parts so a new stroke repaints only the parts it touches:
+    // on the reMarkable 2 a repainted Canvas goes to the panel whole, and the next stroke waits
+    // for it. Elsewhere one part covers the stage (frameTile).
     Component {
         id: canvasComp
-        Canvas {
+        Item {
             anchors.fill: parent
+            onWidthChanged: root.layoutParts(root.frameOf(this))
+            onHeightChanged: root.layoutParts(root.frameOf(this))
+        }
+    }
+    Component {
+        id: partComp
+        Canvas {
             renderTarget: Canvas.Image
             renderStrategy: Canvas.Immediate
-            onWidthChanged: root.repaint(root.frameOf(this))
-            onHeightChanged: root.repaint(root.frameOf(this))
+            onAvailableChanged: if (available) requestPaint() // a paint asked for before it was ready did nothing
             onPaint: root.paintFrame(this)
         }
     }
@@ -300,9 +334,22 @@ Rectangle {
     // FRAMES
     // ---------------------------------------------------------------
     function newDrawing(strokes) {
-        var d = { key: ++frameKeys, rev: 0, strokes: strokes, undo: [], redo: [], queue: [], full: true, trash: [], edits: null };
+        var d = { key: ++frameKeys, rev: 0, strokes: strokes, undo: [], redo: [], parts: [], trash: [], edits: null };
         d.canvas = canvasComp.createObject(stage);
+        layoutParts(d);
         return d;
+    }
+
+    // Cut the drawing's canvas into parts of frameTile px, each repainted in full
+    function layoutParts(f) {
+        if (!f) return;
+        f.parts.forEach(p => p.canvas.destroy());
+        var c = f.canvas, T = frameTile;
+        f.parts = [];
+        for (var y = 0; y < c.height; y += T)
+            for (var x = 0; x < c.width; x += T)
+                f.parts.push({ canvas: partComp.createObject(c, { x: x, y: y, width: Math.min(T, c.width - x), height: Math.min(T, c.height - y) }),
+                               full: true, dirty: null, queue: [] });
     }
 
     // A layer always starts with a drawing: if its first frame became a hold, its first drawing moves there
@@ -388,8 +435,8 @@ Rectangle {
     function deleteLayer(l) {
         if (layers.length <= 1) return;
         layers.splice(l, 1)[0].cels.forEach(d => d && d.canvas.destroy());
+        currentLayer = Math.min(currentLayer, layers.length - 1); // before layerCount, whose bindings index layers by it
         layerCount = layers.length;
-        currentLayer = Math.min(currentLayer, layerCount - 1);
         refreshLayers();
         historyRev++;
     }
@@ -413,10 +460,11 @@ Rectangle {
                 if (!d) continue;
                 d.canvas.z = -0.1 * l; // upper layers on top, all above the onion skin
                 d.canvas.visible = d === shown;
-                if (d.canvas.visible && (d.full || d.queue.length)) d.canvas.requestPaint();
+                if (d.canvas.visible) d.parts.forEach(p => { if (pending(p)) p.canvas.requestPaint(); });
+                else dropTrash(d); // unbaked ink would float over other frames
             }
         }
-        onionCanvas.requestPaint();
+        if (onionCanvas.visible) onionCanvas.requestPaint(); // a hidden Canvas still paints: none while playing
     }
 
     Timer {
@@ -432,8 +480,7 @@ Rectangle {
     // ---------------------------------------------------------------
     function repaint(f) {
         if (!f || !f.canvas) return;
-        f.full = true;
-        f.canvas.requestPaint();
+        f.parts.forEach(p => { p.full = true; p.canvas.requestPaint(); });
     }
 
     // Redraw only one area (the eraser's footprint): much less drawing, and the e-ink
@@ -442,14 +489,24 @@ Rectangle {
         if (!f || !f.canvas) return;
         // Strokes still waiting to be drawn may have just been erased; drop the stale
         // copies and redraw their area from the current stroke list instead
-        for (var i = 0; i < f.queue.length; i++) {
-            var b = bounds(f.queue[i]);
-            r = unite(r, { x: b.x0 - b.w, y: b.y0 - b.w, w: b.x1 - b.x0 + 2 * b.w, h: b.y1 - b.y0 + 2 * b.w });
+        for (var p of f.parts) {
+            for (var s of p.queue) p.dirty = p.dirty ? unite(p.dirty, strokeRect(s)) : strokeRect(s);
+            p.queue = [];
         }
-        f.queue = [];
-        if (f.dirty) r = unite(f.dirty, r);
-        f.dirty = r;
-        f.canvas.markDirty(Qt.rect(r.x, r.y, r.w, r.h));
+        for (p of partsIn(f, r)) p.dirty = p.dirty ? unite(p.dirty, r) : r;
+        for (p of f.parts) if (p.dirty) markPart(p, p.dirty);
+    }
+
+    // The parts of drawing f that overlap r (stage coordinates)
+    function partsIn(f, r) {
+        return f.parts.filter(p => overlaps(p.canvas, r));
+    }
+    function overlaps(c, r) { return r.x < c.x + c.width && r.x + r.w > c.x && r.y < c.y + c.height && r.y + r.h > c.y; }
+    function pending(p) { return p.full || p.dirty || p.queue.length; }
+    function markPart(p, r) { p.canvas.markDirty(Qt.rect(r.x - p.canvas.x, r.y - p.canvas.y, r.w, r.h)); }
+    function strokeRect(s) {
+        var b = bounds(s);
+        return { x: b.x0 - b.w, y: b.y0 - b.w, w: b.x1 - b.x0 + 2 * b.w, h: b.y1 - b.y0 + 2 * b.w };
     }
 
     function unite(a, b) {
@@ -459,52 +516,56 @@ Rectangle {
 
     // Queue a stroke to be drawn onto the frame image, updating only its own area
     function queueStroke(f, s) {
-        var b = bounds(s);
-        f.queue.push(s);
-        f.canvas.markDirty(Qt.rect(b.x0 - b.w, b.y0 - b.w, b.x1 - b.x0 + 2 * b.w, b.y1 - b.y0 + 2 * b.w));
+        var r = strokeRect(s);
+        for (var p of partsIn(f, r)) { p.queue.push(s); markPart(p, r); }
+    }
+
+    // The live tiles of strokes not baked yet
+    function dropTrash(f) {
+        for (var j = 0; j < f.trash.length; j++) f.trash[j].destroy();
+        f.trash = [];
     }
 
     // Looked up rather than stored on the Canvas: a JS object assigned to a QML
     // property is copied, so the Canvas would see a stale snapshot
     function frameOf(c) {
-        return drawings().find(d => d.canvas === c) || null;
+        return drawings().find(d => d.canvas === c || d.canvas === c.parent) || null; // a drawing, or one of its parts
     }
 
-    // Draws onto the frame's image: everything after undo/clear, only the dirty area after
-    // an erase, then any newly queued strokes
+    // Draws onto one part of the frame's image: everything after undo/clear, only the dirty
+    // area after an erase, then any newly queued strokes
     function paintFrame(c) {
-        var f = frameOf(c), ctx = c.getContext("2d");
-        if (!f || !ctx) return;
-        var t0 = Date.now(), drawn = 0, mode = f.full ? "full" : f.dirty ? "area" : "queue";
-        if (f.full) {
-            ctx.clearRect(0, 0, c.width, c.height);
-            for (var i = 0; i < f.strokes.length; i++) drawStroke(ctx, f.strokes[i]);
-            drawn = f.strokes.length;
-        } else {
-            var d = f.dirty;
-            if (d) {
-                ctx.save();
-                ctx.beginPath();
-                ctx.rect(d.x, d.y, d.w, d.h);
-                ctx.clip();
-                ctx.clearRect(d.x, d.y, d.w, d.h);
-                for (var k = 0; k < f.strokes.length; k++) {
-                    var b = bounds(f.strokes[k]), m = b.w / 2;
-                    if (b.x1 + m < d.x || b.x0 - m > d.x + d.w || b.y1 + m < d.y || b.y0 - m > d.y + d.h) continue;
-                    drawStroke(ctx, f.strokes[k]);
-                    drawn++;
-                }
-                ctx.restore();
+        var f = frameOf(c), p = f && f.parts.find(p => p.canvas === c), ctx = c.getContext("2d");
+        if (!p || !ctx) return;
+        var t0 = Date.now(), drawn = 0, mode = p.full ? "full" : p.dirty ? "area" : "queue";
+        ctx.save();
+        ctx.translate(-c.x, -c.y); // strokes are in stage coordinates
+        var d = p.full ? { x: c.x, y: c.y, w: c.width, h: c.height } : p.dirty;
+        if (d) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(d.x, d.y, d.w, d.h);
+            ctx.clip();
+            ctx.clearRect(d.x, d.y, d.w, d.h);
+            for (var k = 0; k < f.strokes.length; k++) {
+                var b = bounds(f.strokes[k]), m = b.w / 2;
+                if (b.x1 + m < d.x || b.x0 - m > d.x + d.w || b.y1 + m < d.y || b.y0 - m > d.y + d.h) continue;
+                drawStroke(ctx, f.strokes[k]);
+                drawn++;
             }
-            for (var q = 0; q < f.queue.length; q++) drawStroke(ctx, f.queue[q]);
-            drawn += f.queue.length;
+            ctx.restore();
         }
-        f.full = false;
-        f.dirty = null;
-        f.queue = [];
+        if (!p.full) for (var q = 0; q < p.queue.length; q++) drawStroke(ctx, p.queue[q]);
+        drawn += p.queue.length;
+        ctx.restore();
+        p.full = false;
+        p.dirty = null;
+        p.queue = [];
+        // A part without ink stays hidden, so changing frames redraws only where there's ink
+        // (on the reMarkable 2 the panel update's cost grows with its area)
+        c.visible = f.strokes.some(s => overlaps(c, strokeRect(s)));
         // The ink is on the image now, so the live preview dots can go
-        for (var j = 0; j < f.trash.length; j++) f.trash[j].destroy();
-        f.trash = [];
+        if (!f.parts.some(pending)) dropTrash(f);
         var ms = Date.now() - t0;
         if (ms > 10) console.log("[Animator][perf] paint", mode, drawn, "strokes", ms, "ms");
     }
@@ -688,35 +749,92 @@ Rectangle {
         return s.box;
     }
 
-    // Rub out only what's under the eraser: drop the covered points and split the stroke
-    // into the pieces that remain (like the notebook app's eraser)
-    function eraseAt(x, y) {
-        var R = 16, strokes = frame.strokes, hitAny = false;
+    // A stroke's points in runs of eraseRun, each with its own box, so the eraser looks only at
+    // the runs it's near (a long scribble is near on most moves but touched on few)
+    function runsOf(s) {
+        var b = bounds(s);
+        if (!b.runs) {
+            b.runs = [];
+            for (var i = 0; i < s.pts.length; i += eraseRun) b.runs.push(boxOf(s.pts, i, Math.min(i + eraseRun, s.pts.length)));
+        }
+        return b.runs;
+    }
+
+    // The box of points i0..i1 (plain comparisons: Math calls are slow on the reMarkable 2)
+    function boxOf(pts, i0, i1) {
+        var u = { i0: i0, i1: i1, x0: 1e9, y0: 1e9, x1: -1e9, y1: -1e9 };
+        for (var j = i0; j < i1; j++) {
+            var p = pts[j];
+            if (p.x < u.x0) u.x0 = p.x;
+            if (p.x > u.x1) u.x1 = p.x;
+            if (p.y < u.y0) u.y0 = p.y;
+            if (p.y > u.y1) u.y1 = p.y;
+        }
+        return u;
+    }
+
+    // Points from..to of stroke s as a stroke of its own, with its boxes carried over from s's runs:
+    // measuring a long stroke's leftover afresh on every eraser move is what kept erasing slow
+    function pieceOf(s, from, to) {
+        var b = { x0: 1e9, y0: 1e9, x1: -1e9, y1: -1e9, w: s.box.w, runs: [] }; // w: at most the whole stroke's
+        for (var u of s.box.runs) {
+            var i0 = Math.max(u.i0, from), i1 = Math.min(u.i1, to);
+            if (i0 >= i1) continue;
+            var v = i0 === u.i0 && i1 === u.i1 ? { x0: u.x0, y0: u.y0, x1: u.x1, y1: u.y1 } : boxOf(s.pts, i0, i1);
+            v.i0 = i0 - from;
+            v.i1 = i1 - from;
+            b.runs.push(v);
+            if (v.x0 < b.x0) b.x0 = v.x0;
+            if (v.x1 > b.x1) b.x1 = v.x1;
+            if (v.y0 < b.y0) b.y0 = v.y0;
+            if (v.y1 > b.y1) b.y1 = v.y1;
+        }
+        return { tool: s.tool, color: s.color, pts: s.pts.slice(from, to), box: b };
+    }
+
+    // Rub out only what the eraser covered moving from (x0, y0) to (x, y): drop the covered
+    // points and split the stroke into the pieces that remain (like the notebook app's eraser).
+    // One pass per pen move, each point measured once against the whole path: a long scribble
+    // is thousands of points, too many to re-check every few pixels on the reMarkable 2
+    function eraseAlong(x0, y0, x, y) {
+        var R = eraseRadius, strokes = frame.strokes, hitAny = false;
+        var dx = x - x0, dy = y - y0, len2 = dx * dx + dy * dy;
+        var minX = Math.min(x0, x), maxX = Math.max(x0, x), minY = Math.min(y0, y), maxY = Math.max(y0, y);
         for (var i = strokes.length - 1; i >= 0; i--) {
             var s = strokes[i], b = bounds(s), reach = R + b.w / 2;
-            if (x < b.x0 - reach || x > b.x1 + reach || y < b.y0 - reach || y > b.y1 + reach) continue;
-            var pieces = [], run = [], hit = false;
-            for (var j = 0; j < s.pts.length; j++) {
-                var p = s.pts[j];
-                if (Math.hypot(p.x - x, p.y - y) < R + p.w / 2) {
-                    hit = true;
-                    if (run.length) pieces.push(run);
-                    run = [];
-                } else run.push(p);
+            if (maxX < b.x0 - reach || minX > b.x1 + reach || maxY < b.y0 - reach || minY > b.y1 + reach) continue;
+            // Find the covered points first: a big stroke is near the eraser on most moves but
+            // touched on few, and copying its points every time made erasing crawl
+            var cut = [], runs = runsOf(s);
+            for (var q = 0; q < runs.length; q++) {
+                var u = runs[q];
+                if (maxX < u.x0 - reach || minX > u.x1 + reach || maxY < u.y0 - reach || minY > u.y1 + reach) continue;
+                for (var j = u.i0; j < u.i1; j++) {
+                    var p = s.pts[j], r = R + p.w / 2;
+                    if (p.x > minX - r && p.x < maxX + r && p.y > minY - r && p.y < maxY + r && nearPath(p.x - x0, p.y - y0, dx, dy, len2, r)) cut.push(j);
+                }
             }
-            if (!hit) continue;
-            if (run.length) pieces.push(run);
-            var repl = [];
-            for (var k = 0; k < pieces.length; k++)
-                if (pieces[k].length > 1 || s.pts.length === 1) repl.push({ tool: s.tool, color: s.color, pts: pieces[k] });
+            if (!cut.length) continue;
+            cut.push(s.pts.length);
+            var repl = [], from = 0;
+            for (var k = 0; k < cut.length; k++) {
+                if (cut[k] - from > 1) repl.push(pieceOf(s, from, cut[k]));
+                from = cut[k] + 1;
+            }
             spliceStrokes(frame, i, 1, repl);
             hitAny = true;
         }
         if (hitAny) {
             eraseOp.hit = true;
             var pad = R + 20; // covers the removed ink and the new round ends
-            repaintArea(frame, { x: x - pad, y: y - pad, w: 2 * pad, h: 2 * pad });
+            repaintArea(frame, { x: minX - pad, y: minY - pad, w: maxX - minX + 2 * pad, h: maxY - minY + 2 * pad });
         }
+    }
+
+    // Whether a point (px, py), relative to the path's start, is within r of the path (dx, dy)
+    function nearPath(px, py, dx, dy, len2, r) {
+        var t = len2 && Math.max(0, Math.min(1, (px * dx + py * dy) / len2)), ex = px - t * dx, ey = py - t * dy;
+        return ex * ex + ey * ey < r * r;
     }
 
     // ---------------------------------------------------------------
@@ -724,16 +842,28 @@ Rectangle {
     // ---------------------------------------------------------------
     function beginGesture(pt, eraserEnd) {
         if (isPlaying || showExportModal || !frame) return;
+        if (live || liveErasing) endGesture(); // its release never came: keep it, don't orphan its tiles
         var x = pt.position.x, y = pt.position.y;
         if (eraserEnd) {
             liveErasing = true;
-            eraseOp = { x: x, y: y, before: frame.strokes.slice(), hit: false };
-            eraseAt(x, y);
+            eraseOp = { x: x, y: y, before: frame.strokes.slice(), hit: false, x0: x, y0: y, x1: x, y1: y };
+            eraseAlong(x, y, x, y);
             return;
         }
         var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
         live = { tool: "pen", color: inkColor, pts: [p], tiles: {} };
         addSegment(live, p, p);
+    }
+
+    // Only the backend knows which end is down, and on the reMarkable 2 its word can come just
+    // after the touch (the pen is in range a few ms before it lands): redo the stroke as an erase
+    function liveToEraser() {
+        var pts = live.pts;
+        for (var k in live.tiles) live.tiles[k].canvas.destroy();
+        live = null;
+        moveWaiting = 0;
+        beginGesture({ position: Qt.point(pts[0].x, pts[0].y) }, true);
+        for (var i = 1; i < pts.length; i++) moveGestureImpl({ position: Qt.point(pts[i].x, pts[i].y) });
     }
 
     function moveGesture(pt) {
@@ -747,16 +877,17 @@ Rectangle {
     function moveGestureImpl(pt) {
         var x = pt.position.x, y = pt.position.y;
         if (liveErasing) {
-            // Sweep the eraser along the path so fast swipes don't skip strokes
-            var n = Math.ceil(Math.hypot(x - eraseOp.x, y - eraseOp.y) / 8);
-            for (var k = 1; k <= n; k++) eraseAt(eraseOp.x + (x - eraseOp.x) * k / n, eraseOp.y + (y - eraseOp.y) * k / n);
+            // Erase along the whole path since the last move so fast swipes don't skip strokes
+            eraseAlong(eraseOp.x, eraseOp.y, x, y);
             eraseOp.x = x; eraseOp.y = y;
+            eraseOp.x0 = Math.min(eraseOp.x0, x); eraseOp.x1 = Math.max(eraseOp.x1, x);
+            eraseOp.y0 = Math.min(eraseOp.y0, y); eraseOp.y1 = Math.max(eraseOp.y1, y);
             return;
         }
         if (!live) return;
         var last = live.pts[live.pts.length - 1];
         var dx = x - last.x, dy = y - last.y;
-        if (dx * dx + dy * dy < 4) return; // 2px minimum step
+        if (dx * dx + dy * dy < minStep * minStep) return;
         var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
         live.pts.push(p);
         addSegment(live, last, p);
@@ -765,6 +896,11 @@ Rectangle {
     function endGesture() {
         if (liveErasing) console.log("[Animator][perf] erase", eraseOp.ev || 0, "moves,", eraseOp.ms || 0, "ms JS");
         if (liveErasing && eraseOp.hit) pushOp({ t: "swap", before: eraseOp.before, after: frame.strokes.slice() });
+        if (liveErasing && isRm2) { // the animator-ink extension whited the whole path, other layers' ink too: draw it again
+            var pad = eraseRadius + 4;
+            refreshPatch.x = eraseOp.x0 - pad; refreshPatch.y = eraseOp.y0 - pad;
+            refreshPatch.width = eraseOp.x1 - eraseOp.x0 + 2 * pad; refreshPatch.height = eraseOp.y1 - eraseOp.y0 + 2 * pad;
+        }
         if (live) {
             var f = frame, s = { tool: live.tool, color: live.color, pts: live.pts };
             spliceStrokes(f, f.strokes.length, 0, [s]);
@@ -774,7 +910,7 @@ Rectangle {
             console.log("[Animator][perf] stroke", s.pts.length, "pts,", Object.keys(live.tiles).length, "tiles,", live.ev || 0, "moves,",
                         live.ms || 0, "ms JS (", ((live.ms || 0) / Math.max(1, live.ev || 0)).toFixed(1), "ms/move ),",
                         live.frames || 0, "frames, move->frame avg", ((live.lat || 0) / Math.max(1, live.frames || 0)).toFixed(0),
-                        "ms max", live.latMax || 0, "ms");
+                        "ms max", live.latMax || 0, "ms,", live.palm || 0, "palm moves refused");
         }
         live = null;
         moveWaiting = 0;
@@ -993,22 +1129,28 @@ Rectangle {
                 visible: !root.isPlaying && root.onionDepth > 0
                 renderTarget: Canvas.Image
                 renderStrategy: Canvas.Immediate
+                onVisibleChanged: if (visible) requestPaint()
                 onPaint: root.paintOnion(this)
             }
+            // Paper under everything: moving it makes Qt draw its old and new area again
+            Rectangle { id: refreshPatch; z: -2; color: root.color; visible: root.isRm2; width: 0; height: 0 }
         }
         Item { id: liveLayer; anchors.fill: parent; z: 1 } // pen preview above the frames
 
         // Tell xochitl which e-ink waveform to use for this region. UFast puts the live stroke
-        // (and the eraser's gaps) on the panel noticeably sooner; it's 1-bit, so grey ink settles when Fast takes over
+        // (and the eraser's gaps) on the panel noticeably sooner; it's 1-bit, so grey ink settles when Fast takes over.
+        // Not on the reMarkable 2: there a switch repaints the whole canvas in software (~200 ms
+        // before each stroke shows), and switching often leaves the panel out of step with the app
         DisplayMethodArea {
             anchors.fill: parent
             displayMethod: root.isPlaying ? DisplayMethodArea.Animate
-                         : root.live || root.liveErasing ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
+                         : (root.live || root.liveErasing) && !root.isRm2 ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
         }
 
         // The Marker reaches AppLoad apps as plain (non-synthesized) mouse events. Fingers
         // arrive as synthesized ones; refusing those means palms never draw. The eraser end
-        // is reported by the pen backend (or as a non-left button).
+        // is reported by the pen backend (or as a non-left button). On the reMarkable 2 a resting
+        // palm's moves and releases also reach the stroke, so those are refused too.
         MouseArea {
             anchors.fill: parent
             acceptedButtons: Qt.AllButtons
@@ -1018,8 +1160,11 @@ Rectangle {
                 root.beginGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure },
                                   root.eraserTool || root.penEraser || m.button !== Qt.LeftButton);
             }
-            onPositionChanged: (m) => root.moveGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure })
-            onReleased: root.endGesture()
+            onPositionChanged: (m) => {
+                if (!root.isRm2 || m.source === Qt.MouseEventNotSynthesized) root.moveGesture({ position: Qt.point(m.x, m.y), pressure: root.penPressure });
+                else if (root.live) root.live.palm = (root.live.palm || 0) + 1;
+            }
+            onReleased: (m) => { if (!root.isRm2 || m.source === Qt.MouseEventNotSynthesized) root.endGesture(); }
             onCanceled: root.endGesture()
         }
 
