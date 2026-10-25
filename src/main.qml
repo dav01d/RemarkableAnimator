@@ -78,6 +78,7 @@ Rectangle {
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
     property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
+    property int bakeMs: 500            // pen rest before new strokes are baked into the frame image
 
     // Export
     property string statusMessage: ""
@@ -416,6 +417,7 @@ Rectangle {
                 d.canvas.z = -0.1 * l; // upper layers on top, all above the onion skin
                 d.canvas.visible = d === shown;
                 if (d.canvas.visible && (d.full || d.queue.length)) d.canvas.requestPaint();
+                else if (!d.canvas.visible) dropTrash(d); // unbaked ink would float over other frames
             }
         }
         onionCanvas.requestPaint();
@@ -460,11 +462,32 @@ Rectangle {
         return { x: x, y: y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y };
     }
 
-    // Queue a stroke to be drawn onto the frame image, updating only its own area
+    // Queue a stroke to be drawn onto the frame image, updating only its own area. Not at once:
+    // baking repaints the frame, and on the reMarkable 2 a stroke started meanwhile waits for
+    // it. Until the pen rests the stroke stays in its live tiles.
     function queueStroke(f, s) {
-        var b = bounds(s);
+        var b = bounds(s), r = { x: b.x0 - b.w, y: b.y0 - b.w, w: b.x1 - b.x0 + 2 * b.w, h: b.y1 - b.y0 + 2 * b.w };
         f.queue.push(s);
-        f.canvas.markDirty(Qt.rect(b.x0 - b.w, b.y0 - b.w, b.x1 - b.x0 + 2 * b.w, b.y1 - b.y0 + 2 * b.w));
+        f.bake = f.bake ? unite(f.bake, r) : r;
+        bakeTimer.restart();
+    }
+
+    Timer {
+        id: bakeTimer
+        interval: root.bakeMs
+        onTriggered: {
+            if (root.live || root.liveErasing) return; // the pen's back: pen-up starts the wait again
+            for (var d of root.drawings()) {
+                if (d.bake && d.canvas.visible) d.canvas.markDirty(Qt.rect(d.bake.x, d.bake.y, d.bake.w, d.bake.h));
+                d.bake = null; // a hidden drawing bakes its queue when shown again (refreshLayers)
+            }
+        }
+    }
+
+    // The live tiles of strokes not baked yet
+    function dropTrash(f) {
+        for (var j = 0; j < f.trash.length; j++) f.trash[j].destroy();
+        f.trash = [];
     }
 
     // Looked up rather than stored on the Canvas: a JS object assigned to a QML
@@ -506,8 +529,7 @@ Rectangle {
         f.dirty = null;
         f.queue = [];
         // The ink is on the image now, so the live preview dots can go
-        for (var j = 0; j < f.trash.length; j++) f.trash[j].destroy();
-        f.trash = [];
+        dropTrash(f);
         var ms = Date.now() - t0;
         if (ms > 10) console.log("[Animator][perf] paint", mode, drawn, "strokes", ms, "ms");
     }
