@@ -72,6 +72,13 @@ scp -o StrictHostKeyChecking=no -r "$srcDir/*" "${dest}:${remoteAppDir}/"
 Write-Host "Setting executable permissions..."
 ssh -o StrictHostKeyChecking=no $dest "chmod +x $remoteAppDir/backend/entry $remoteAppDir/backend/*/entry 2>/dev/null || true"
 
+# reMarkable 2 only: the animator-ink XOVI extension inks the pen and eraser through xochitl's own
+# fast pen path (extension/animator-ink.c). It loads when xochitl restarts and stays off on any
+# other xochitl build. Swapped in by rename: overwriting the file xochitl has loaded can crash it.
+$extDir = "/home/root/xovi/extensions.d"
+ssh -o StrictHostKeyChecking=no $dest ('test $(uname -m) = armv7l || exit 0; ' +
+    "cp $remoteAppDir/extension/animator-ink.so $extDir/.animator-ink.new && mv -f $extDir/.animator-ink.new $extDir/animator-ink.so && echo 'Installed the reMarkable 2 pen extension'")
+
 # AppLoad caches the app's resources.rcc until xochitl restarts, so reopening the app still runs
 # the old code. -Restart reloads xochitl; if a reboot wiped XOVI's tmpfs hook, xovi/start
 # reinstalls it. Restarting xochitl while the app is open can crash it, hence opt-in.

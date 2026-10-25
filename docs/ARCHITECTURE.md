@@ -10,8 +10,9 @@ running inside xochitl (the reMarkable UI), plus a tiny native backend for pen p
 | `src/ExportWorker.js` | Builds the export: 1-bit animated GIF, animated SVG, a zip of SVG frames or a PDF flipbook (WorkerScript thread) |
 | `src/StorageWorker.js` | Saves, loads and lists projects as JSON (WorkerScript thread) |
 | `src/QrCode.js` | QR code generator (byte mode, level M) for the share screen |
-| `backend/pen.c` → `src/backend/entry` | Streams Marker pressure, tilt and eraser end to the frontend |
+| `backend/pen.c` → `src/backend/<cpu>/entry` | Streams pen pressure, tilt and eraser end to the frontend; `src/backend/entry` starts the one for the tablet's CPU (`aarch64`: Paper Pro, `armv7l`: reMarkable 2) |
 | `backend/share.c` (in the same binary) | Wi-Fi share: serves the latest export over HTTP on port 8765 for 10 minutes and reports the link |
+| `extension/animator-ink.c` → `src/extension/animator-ink.so` | reMarkable 2 only: a XOVI extension that inks the pen and eraser through xochitl's own fast pen path while Animator arms it (see below) |
 
 ## What the platform taught us
 | Behaviour on the tablet (OS 3.28) | How the app handles it |
@@ -28,6 +29,15 @@ running inside xochitl (the reMarkable UI), plus a tiny native backend for pen p
 | AppLoad caches an app's `resources.rcc` until xochitl restarts; a reboot drops XOVI (its hook lives on tmpfs). | Deploying is copy, close the app, restart xochitl (`deploy.ps1 -Restart`). If AppLoad disappears after a reboot, run `/home/root/xovi/start`. |
 | AppLoad's virtual keyboard only serves framebuffer apps. | Rename has its own on-screen keyboard. |
 | QML can't listen on a socket. | The Wi-Fi share writes the export next to the projects and asks the backend (message 2) to serve it; the backend answers with `http://<Wi-Fi IP>:8765/<file>`, which the QR code shows. Its sockets are non-blocking and live in the pen's poll loop, so a phone never stalls the pen. |
+
+## The reMarkable 2
+| Behaviour (OS 3.29.0.153) | How the app handles it |
+|---|---|
+| The panel is driven in software (SWTCON). Updates cost more the bigger they are, and a new one waits for any overlapping update still running. | Smaller live tiles (64 px), a drawing's ink in 400 px parts so a stroke repaints only what it touched, blank parts hidden so playback updates only inked areas, half the stroke points. |
+| Switching a region's waveform repaints it in software (~200 ms), and `UFast` (xochitl's pen mode) only draws pixels marked in a pen mask Qt never sets, which leaves stuck ink. | The canvas stays on `Fast`. |
+| xochitl's own pen bypasses Qt: it writes the screen image and that mask itself and queues DU updates flagged *FastDraw*, which don't wait for each other. | The `animator-ink` extension does the same for Animator. Animator arms it with a heartbeat file (`/tmp/animator-ink`: canvas rect, pen size, eraser tool and radius; off after 3 s without one). It reads the pen's evdev itself and inks black, or white for the eraser, as a preview; Animator still draws, erases and saves the real strokes, and when the eraser lifts it moves a paper patch over the rubbed area so Qt draws other layers there again. The extension calls stripped xochitl functions by address, so it checks xochitl's build-id and stays off on any other build. |
+| The pen enters range only 5–30 ms before it touches, so the backend's eraser word can come after the press; the pen's release sometimes arrives as a synthesized (palm-like) event; resting palms move the mouse. | A late eraser word redoes the stroke as an erase; the backend's "not touching" ends a stroke; synthesized moves and releases are refused. |
+| AppLoad can start the backend before its socket exists. | The backend retries connecting for 5 s. |
 
 ## Data
 Projects live in `/home/root/.local/share/remarkable-animator/`: `index.json` lists them (with a
