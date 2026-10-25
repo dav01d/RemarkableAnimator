@@ -77,12 +77,14 @@ Rectangle {
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
     property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
-    property bool inkSettling: false    // the canvas is on Fast for a moment (see its DisplayMethodArea)
-    property int settleMs: 700          // pen rest before the Fast pass, and how long the pass lasts
+    property int canvasMethod: DisplayMethodArea.UFast // the canvas waveform between strokes (see its DisplayMethodArea)
+    property int settleMs: 700          // pen rest before the Fast pass, and how long a pass lasts
 
-    // A Fast pass, now (a new picture: frame change, undo) or once the pen has rested (new ink)
+    // A full refresh now for a new picture (frame change, undo): ink drawn on UFast leaves the
+    // panel out of step, and only a full refresh repaints it truly. New ink gets a calm Fast pass
+    // once the pen has rested.
     function settle(now) {
-        if (now) inkSettling = true;
+        if (now) canvasMethod = DisplayMethodArea.Content;
         settleTimer.restart();
     }
     Timer {
@@ -90,8 +92,8 @@ Rectangle {
         interval: root.settleMs
         onTriggered: {
             if (root.live || root.liveErasing) return; // the pen's back: try again at pen-up
-            root.inkSettling = !root.inkSettling;
-            if (root.inkSettling) restart();
+            if (root.canvasMethod !== DisplayMethodArea.UFast) root.canvasMethod = DisplayMethodArea.UFast;
+            else { root.canvasMethod = DisplayMethodArea.Fast; restart(); }
         }
     }
 
@@ -1042,12 +1044,11 @@ Rectangle {
         // Tell xochitl which e-ink waveform to use for this region. UFast puts new ink on the panel
         // noticeably sooner, but it's 1-bit and doesn't clear old ink. A switch repaints the whole
         // canvas (~200 ms on the reMarkable 2), so it never happens at pen-down: the canvas waits
-        // on UFast, and a Fast pass while the pen rests settles grey ink and clears ghosts.
-        // Erasing needs Fast to clear.
+        // on UFast, with passes while the pen rests (see settle). Erasing needs Fast to clear.
         DisplayMethodArea {
             anchors.fill: parent
             displayMethod: root.isPlaying ? DisplayMethodArea.Animate
-                         : root.inkSettling || root.liveErasing ? DisplayMethodArea.Fast : DisplayMethodArea.UFast
+                         : root.liveErasing ? DisplayMethodArea.Fast : root.canvasMethod
         }
 
         // The Marker reaches AppLoad apps as plain (non-synthesized) mouse events. Fingers
