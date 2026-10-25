@@ -467,7 +467,6 @@ Rectangle {
             }
         }
         if (onionCanvas.visible) onionCanvas.requestPaint(); // a hidden Canvas still paints: none while playing
-        console.log("[Animator][perf] frame", current, "live items", liveLayer.children.length, "rM2", isRm2, Screen.width + "x" + Screen.height);
     }
 
     Timer {
