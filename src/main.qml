@@ -67,6 +67,7 @@ Rectangle {
             var v = contents.split(" "); // "pressure tiltX tiltY eraser touching"
             root.penPressure = v[0] / 1000;
             root.penEraser = v[3] === "1";
+            if (root.penEraser && root.live) root.liveToEraser();
         }
     }
 
@@ -76,6 +77,23 @@ Rectangle {
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
     property bool liveErasing: false
     property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
+    property bool inkSettling: false    // the canvas is on Fast for a moment (see its DisplayMethodArea)
+    property int settleMs: 700          // pen rest before the Fast pass, and how long the pass lasts
+
+    // A Fast pass, now (a new picture: frame change, undo) or once the pen has rested (new ink)
+    function settle(now) {
+        if (now) inkSettling = true;
+        settleTimer.restart();
+    }
+    Timer {
+        id: settleTimer
+        interval: root.settleMs
+        onTriggered: {
+            if (root.live || root.liveErasing) return; // the pen's back: try again at pen-up
+            root.inkSettling = !root.inkSettling;
+            if (root.inkSettling) restart();
+        }
+    }
 
     // Export
     property string statusMessage: ""
@@ -417,6 +435,7 @@ Rectangle {
             }
         }
         onionCanvas.requestPaint();
+        settle(true);
     }
 
     Timer {
@@ -434,6 +453,7 @@ Rectangle {
         if (!f || !f.canvas) return;
         f.full = true;
         f.canvas.requestPaint();
+        settle(true);
     }
 
     // Redraw only one area (the eraser's footprint): much less drawing, and the e-ink
@@ -746,6 +766,17 @@ Rectangle {
         addSegment(live, p, p);
     }
 
+    // Only the backend knows which end is down, and on the reMarkable 2 its word can come just
+    // after the touch (the pen is in range a few ms before it lands): redo the stroke as an erase
+    function liveToEraser() {
+        var pts = live.pts;
+        for (var k in live.tiles) live.tiles[k].canvas.destroy();
+        live = null;
+        moveWaiting = 0;
+        beginGesture({ position: Qt.point(pts[0].x, pts[0].y) }, true);
+        for (var i = 1; i < pts.length; i++) moveGestureImpl({ position: Qt.point(pts[i].x, pts[i].y) });
+    }
+
     function moveGesture(pt) {
         var t0 = Date.now();
         if (live && !moveWaiting) moveWaiting = t0;
@@ -789,6 +820,7 @@ Rectangle {
         moveWaiting = 0;
         eraseOp = null;
         liveErasing = false;
+        settle(false);
     }
 
     // ---------------------------------------------------------------
@@ -1007,12 +1039,15 @@ Rectangle {
         }
         Item { id: liveLayer; anchors.fill: parent; z: 1 } // pen preview above the frames
 
-        // Tell xochitl which e-ink waveform to use for this region. UFast puts the live stroke
-        // (and the eraser's gaps) on the panel noticeably sooner; it's 1-bit, so grey ink settles when Fast takes over
+        // Tell xochitl which e-ink waveform to use for this region. UFast puts new ink on the panel
+        // noticeably sooner, but it's 1-bit and doesn't clear old ink. A switch repaints the whole
+        // canvas (~200 ms on the reMarkable 2), so it never happens at pen-down: the canvas waits
+        // on UFast, and a Fast pass while the pen rests settles grey ink and clears ghosts.
+        // Erasing needs Fast to clear.
         DisplayMethodArea {
             anchors.fill: parent
             displayMethod: root.isPlaying ? DisplayMethodArea.Animate
-                         : root.live || root.liveErasing ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
+                         : root.inkSettling || root.liveErasing ? DisplayMethodArea.Fast : DisplayMethodArea.UFast
         }
 
         // The Marker reaches AppLoad apps as plain (non-synthesized) mouse events. Fingers
