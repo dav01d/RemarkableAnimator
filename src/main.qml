@@ -15,7 +15,7 @@ Rectangle {
 
     // AppLoad contract: emit close() to exit, unloading() is called on teardown
     signal close
-    function unloading() { playTimer.stop(); saveProject(); penBackend.terminate(); } // stop the pen backend too
+    function unloading() { playTimer.stop(); saveProject(); penBackend.terminate(); if (isRm2) armInk(false); } // stop the pen backend too
 
     // ---------------------------------------------------------------
     // MODEL
@@ -50,7 +50,7 @@ Rectangle {
     property int onionDepth: 2          // how many previous frames show through (0 = off)
     readonly property string nextInk: "#2060c0" // the next drawing's onion skin (blue on colour panels)
     property var fpsOptions: [6, 8, 12, 24]
-    property int fpsIndex: 2
+    property int fpsIndex: isRm2 ? 0 : 2 // 6 fps on the reMarkable 2: its panel plays faster ones unevenly
     readonly property int fps: fpsOptions[fpsIndex]
 
     // Pen state streamed by the backend (backend/pen.c): xochitl gives apps the Marker
@@ -58,6 +58,19 @@ Rectangle {
     property real penPressure: 0        // 0..1, 0 = no backend data yet
     property bool penEraser: false
     readonly property bool isRm2: Math.min(Screen.width, Screen.height) === 1404 // its panel's short side (Paper Pro 1620, Move 954)
+
+    // reMarkable 2: the animator-ink xovi extension, when installed, inks the pen's trace through
+    // xochitl's own fast pen path while this heartbeat says the canvas is up ("on x y w h size",
+    // screen px). It counts a heartbeat older than 3 s as off.
+    readonly property bool inkArmed: isRm2 && !!frame && !isPlaying && !showExportModal && !showProjects && !showRename && !eraserTool
+    function armInk(on) {
+        var p = stage.mapToItem(null, 0, 0), xhr = new XMLHttpRequest();
+        xhr.open("PUT", "file:///tmp/animator-ink");
+        xhr.send(on ? ["on", Math.round(p.x), Math.round(p.y), Math.round(stage.width), Math.round(stage.height), sizes[sizeIndex]].join(" ") : "off");
+    }
+    onInkArmedChanged: armInk(inkArmed)
+    onSizeIndexChanged: if (inkArmed) armInk(true)
+    Timer { interval: 1000; repeat: true; running: root.inkArmed; onTriggered: root.armInk(true) }
 
     AppLoad {
         id: penBackend
@@ -256,6 +269,7 @@ Rectangle {
         projectName = p.name;
         var fi = fpsOptions.indexOf(p.fps);
         if (fi >= 0) fpsIndex = fi;
+        else if (isRm2) fpsIndex = 0; // a new project starts at 6 fps there
         resetLayers(p.length ? p.layers : blankLayers());
         if (p.length) drawings().forEach(d => d.edits = []); // the storage worker kept them
         saveProject(); // marks it most recent, so it reopens next launch
@@ -744,20 +758,21 @@ Rectangle {
         for (var i = strokes.length - 1; i >= 0; i--) {
             var s = strokes[i], b = bounds(s), reach = R + b.w / 2;
             if (maxX < b.x0 - reach || minX > b.x1 + reach || maxY < b.y0 - reach || minY > b.y1 + reach) continue;
-            var pieces = [], run = [], hit = false;
+            // Find the covered points first: a big stroke is near the eraser on most moves but
+            // touched on few, and copying its points every time made erasing crawl
+            var cut = [];
             for (var j = 0; j < s.pts.length; j++) {
                 var p = s.pts[j], r = R + p.w / 2;
-                if (p.x > minX - r && p.x < maxX + r && p.y > minY - r && p.y < maxY + r && nearPath(p.x - x0, p.y - y0, dx, dy, len2, r)) {
-                    hit = true;
-                    if (run.length) pieces.push(run);
-                    run = [];
-                } else run.push(p);
+                if (p.x > minX - r && p.x < maxX + r && p.y > minY - r && p.y < maxY + r && nearPath(p.x - x0, p.y - y0, dx, dy, len2, r)) cut.push(j);
             }
-            if (!hit) continue;
-            if (run.length) pieces.push(run);
-            var repl = [];
-            for (var k = 0; k < pieces.length; k++)
-                if (pieces[k].length > 1 || s.pts.length === 1) repl.push({ tool: s.tool, color: s.color, pts: pieces[k] });
+            if (!cut.length) continue;
+            cut.push(s.pts.length);
+            var repl = [], from = 0;
+            for (var k = 0; k < cut.length; k++) {
+                var piece = s.pts.slice(from, cut[k]);
+                if (piece.length > 1) repl.push({ tool: s.tool, color: s.color, pts: piece });
+                from = cut[k] + 1;
+            }
             spliceStrokes(frame, i, 1, repl);
             hitAny = true;
         }
