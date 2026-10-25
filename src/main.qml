@@ -74,7 +74,9 @@ Rectangle {
 
     // Live gesture
     property var live: null             // stroke being drawn, plus tiles: { "col,row": { canvas, segs } }
-    property int liveTile: 128          // px: size of the Canvas tiles the live stroke is drawn into
+    // px: size of the Canvas tiles the live stroke is drawn into. Smaller on the reMarkable 2: its
+    // panel updates cost more the bigger they are, and wait for overlapping ones still running
+    readonly property int liveTile: isRm2 ? 64 : 128
     readonly property int frameTile: isRm2 ? 400 : 100000 // px: parts of a drawing's baked ink (one part off the rM2)
     readonly property int minStep: isRm2 ? 4 : 2 // px between stroke points: half the points on the slower reMarkable 2
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
