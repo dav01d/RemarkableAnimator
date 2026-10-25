@@ -289,9 +289,7 @@ Rectangle {
         }
     }
 
-    // One tile of the live stroke. On the reMarkable 2 it has its own UFast area: there a new update
-    // waits for any overlapping one still on the panel, unless both are UFast, so repainting a tile
-    // on the canvas's Fast stalled. The ink settles on Fast once the frame image takes over at pen-up.
+    // One tile of the live stroke
     Component {
         id: tileComp
         Canvas {
@@ -299,11 +297,6 @@ Rectangle {
             renderTarget: Canvas.Image
             renderStrategy: Canvas.Immediate
             onPaint: root.paintTile(this)
-            Loader {
-                anchors.fill: parent
-                active: root.isRm2
-                sourceComponent: DisplayMethodArea { displayMethod: DisplayMethodArea.UFast }
-            }
         }
     }
 
