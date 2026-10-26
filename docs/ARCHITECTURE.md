@@ -42,7 +42,8 @@ running inside xochitl (the reMarkable UI), plus a tiny native backend for pen p
 ## Data
 Projects live in `/home/root/.local/share/remarkable-animator/`: `index.json` lists them (with a
 small thumbnail of frame 1) and each `<id>.json` holds
-`{ id, name, fps, length, layers: [{ name, visible, cels: [{ at, strokes }] }] }`: a layer's drawing
+`{ id, name, fps, length, layers: [{ name, visible, faded, cels: [{ at, strokes }] }] }`: a layer's drawing
 at frame `at` holds until its next cel. Strokes are stored compactly as
 `{ t: tool, c: color, p: [x, y, width, ...] }`; black is finished ink, any other color is planning
-ink (never exported). Files from before layers (`frames: [strokes]`) open as one layer.
+ink (never exported). A `faded` layer is a rough: drawn at half strength, left out of exports.
+Files from before layers (`frames: [strokes]`) open as one layer.

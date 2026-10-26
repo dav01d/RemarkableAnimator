@@ -58,7 +58,7 @@ var thumbPoints = 300; // about how many points a project list thumbnail keeps
 function thumbnail(layers) {
     var strokes = [], total = 0;
     for (var l = layers.length - 1; l >= 0; l--) // bottom layer first; every layer starts with a drawing
-        if (layers[l].visible && layers[l].cels.length)
+        if (layers[l].visible && !layers[l].faded && layers[l].cels.length)
             layers[l].cels[0].strokes.forEach(function(s) { if (s.c === "#000000") { strokes.push(s.p); total += s.p.length / 3; } });
     var step = Math.max(1, Math.ceil(total / thumbPoints));
     return strokes.map(function(p) {

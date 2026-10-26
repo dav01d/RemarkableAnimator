@@ -84,6 +84,7 @@ Rectangle {
             root.penPressure = v[0] / 1000;
             root.penEraser = v[3] === "1";
             if (root.penEraser && root.live) root.liveToEraser();
+            if (root.penEraser && root.lassoDrag) root.lassoToEraser();
             // On the reMarkable 2 the pen's release can arrive looking like a palm's, which the
             // canvas refuses; the pen leaving the glass ends the stroke instead
             if (root.isRm2 && v[4] === "0" && (root.live || root.liveErasing || root.lassoDrag)) root.endGesture();
@@ -455,7 +456,7 @@ Rectangle {
         if (layers.length <= 1) return;
         var before = timeline();
         layers.splice(l, 1);
-        currentLayer = Math.min(currentLayer, layers.length - 1); // before layerCount, whose bindings index layers by it
+        currentLayer = Math.min(currentLayer - (l < currentLayer ? 1 : 0), layers.length - 1); // before layerCount, whose bindings index layers by it
         layerCount = layers.length;
         timelineEdited(before);
     }
@@ -476,6 +477,7 @@ Rectangle {
         timelineUndo.push({ before: before, after: timeline(), seq: ++editSeq });
         if (timelineUndo.length > timelineUndoMax) timelineUndo.shift();
         timelineRedo = [];
+        drawings().forEach(d => d.redo = []); // a new edit ends every redo
         timelineShown(before);
     }
 
@@ -495,6 +497,7 @@ Rectangle {
 
     // No canvases for drawings that left the timeline since `was`
     function timelineShown(was) {
+        dropLasso(); // its strokes may not be on the drawing under the pen any more
         var now = drawings();
         was.layers.forEach(s => s.cels.forEach(d => {
             if (!d || !d.canvas || now.indexOf(d) >= 0) return;
@@ -769,6 +772,7 @@ Rectangle {
         op.seq = ++editSeq;
         frame.undo.push(op);
         frame.redo = [];
+        timelineRedo = []; // a new edit ends every redo
         historyRev++;
     }
 
@@ -786,6 +790,7 @@ Rectangle {
     }
 
     function undo() {
+        if (live || liveErasing || lassoDrag) return; // a finger on Undo while the pen is busy
         dropLasso();
         var f = frame, op = f && latest(f.undo, timelineUndo);
         if (!op) {
@@ -805,6 +810,7 @@ Rectangle {
     }
 
     function redo() {
+        if (live || liveErasing || lassoDrag) return;
         dropLasso();
         var f = frame, op = f && latest(f.redo, timelineRedo);
         if (!op) {
@@ -824,6 +830,7 @@ Rectangle {
     }
 
     function clearFrame() {
+        dropLasso();
         if (!frame.strokes.length) return;
         if (!layers[currentLayer].cels[current]) toggleHold(); // held: clear a copy, not the earlier frame
         var f = frame;
@@ -984,6 +991,14 @@ Rectangle {
         lassoBox = Qt.rect(lassoBox.x + dx, lassoBox.y + dy, lassoBox.width, lassoBox.height);
         lassoShift = Qt.point(0, 0);
         lassoLifted = false;
+    }
+
+    // The eraser end came down in the box (on the reMarkable 2 its word can come after the press): erase instead
+    function lassoToEraser() {
+        var at = Qt.point(lassoDrag.x, lassoDrag.y);
+        if (lassoLifted) { lassoShift = Qt.point(0, 0); lassoDrop(); }
+        lassoDrag = null;
+        beginGesture({ position: at }, true);
     }
 
     // Let go of the lassoed strokes (but never while they're being dragged)
@@ -1900,7 +1915,7 @@ Rectangle {
         for (var f = 0; f < frameCount; f++) {
             var shown = [];
             for (var l = layers.length - 1; l >= 0; l--) { // bottom layer first
-                var d = layers[l].visible ? drawingAt(l, f) : null;
+                var d = layers[l].visible && !layers[l].faded ? drawingAt(l, f) : null; // a faded layer is a rough
                 if (d) shown.push({ name: layers[l].name, strokes: d.strokes.filter(s => !isPlanning(s)) }); // finished ink only
             }
             frames.push(shown);
