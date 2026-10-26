@@ -2,16 +2,16 @@
 // serializing them on the UI thread would stall xochitl.
 // Files: <dir>/index.json = [{ id, name, updated, frames, thumb }], <dir>/<id>.json = project:
 //   (thumb: frame 1's finished ink as [[x, y, x, y, ...]], a few hundred points at most)
-//   { id, name, fps, length, layers: [{ name, visible, cels: [{ at, strokes }] }] }
+//   { id, name, fps, length, layers: [{ name, visible, faded, cels: [{ at, strokes }] }] }
 //   (version 1 had frames: [strokes] in place of length and layers; it loads as one layer)
 // Strokes are stored compactly: { t: tool, c: color, p: [x, y, w, x, y, w, ...] }.
 //
 // Messages in:  { op: "list", dir } | { op: "load", dir, id } | { op: "delete", dir, id } (replies "list")
-//               | { op: "save", dir, project: { id, name, fps, layers: [{ name, visible, cels: [key | 0] }],
+//               | { op: "save", dir, project: { id, name, fps, layers: [{ name, visible, faded, cels: [key | 0] }],
 //                                             whole: { key: strokes }, edits: { key: [[at, deleteCount, strokes]] } } }
 // A loaded project's drawings are keyed 1..n, layer by layer, as the UI keys them.
 // Messages out: { op: "list", index } | { op: "saved", index } | { op: "error", message }
-//               | { op: "loaded", project: { id, name, fps, length, layers: [{ name, visible, cels: [strokes | null] }] } }
+//               | { op: "loaded", project: { id, name, fps, length, layers: [{ name, visible, faded, cels: [strokes | null] }] } }
 
 function request(method, url, body, done) {
     var xhr = new XMLHttpRequest();
@@ -58,7 +58,7 @@ var thumbPoints = 300; // about how many points a project list thumbnail keeps
 function thumbnail(layers) {
     var strokes = [], total = 0;
     for (var l = layers.length - 1; l >= 0; l--) // bottom layer first; every layer starts with a drawing
-        if (layers[l].visible && layers[l].cels.length)
+        if (layers[l].visible && !layers[l].faded && layers[l].cels.length)
             layers[l].cels[0].strokes.forEach(function(s) { if (s.c === "#000000") { strokes.push(s.p); total += s.p.length / 3; } });
     var step = Math.max(1, Math.ceil(total / thumbPoints));
     return strokes.map(function(p) {
@@ -122,7 +122,7 @@ WorkerScript.onMessage = function(msg) {
                 if (!saved.drawings[key]) return failed("Couldn't save");
                 cels.push({ at: i, strokes: kept[key] = saved.drawings[key] });
             }
-            layers.push({ name: p.layers[l].name, visible: p.layers[l].visible, cels: cels });
+            layers.push({ name: p.layers[l].name, visible: p.layers[l].visible, faded: p.layers[l].faded, cels: cels });
         }
         saved.drawings = kept; // forget deleted drawings
         var body = JSON.stringify({ id: p.id, name: p.name, fps: p.fps, length: length, layers: layers });

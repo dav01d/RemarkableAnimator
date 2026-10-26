@@ -17,12 +17,15 @@ animated SVG (the SVG stays sharp at any size).
 
 ## Features
 - Pressure-sensitive pen in 3 sizes; flip the pen (or tap the eraser button) to erase
-- Black ink for finished lines, light grey for roughs (exports leave grey out). Or sketch on its
-  own layer and hide it with the layer's eye
+- Lasso: loop some strokes, then drag the box to move them
+- Rough on its own layer, then tap its eye to fade it to half strength and draw clean on top
+  (exports leave a faded layer out; tap again to hide it)
 - Up to 3 layers with names; a layer can **Hold** a drawing across frames instead of redrawing it
 - Onion skin: earlier drawings in fading grey, the next one in light blue
 - Timeline and project list with thumbnails; drag frames to reorder; playback at 6–24 fps
-- Undo/redo, rename, delete; everything autosaves on the tablet (works offline)
+- Undo/redo for strokes and for frame and layer edits (new, copy, delete, move, hold); Delete
+  removes only the current layer's drawing
+- Rename, delete; everything autosaves on the tablet (works offline)
 - Palm rejection: a resting hand can't draw or press the timeline and bottom bar; fingers still
   work on the top bar, keyboard and menus, in case you put the pen down
 - Share to your phone with a QR code (see below)

@@ -19,7 +19,7 @@ Rectangle {
 
     // ---------------------------------------------------------------
     // MODEL
-    // layers[l] = { name, visible, cels: [drawing | null] }: top layer first, one cel per frame;
+    // layers[l] = { name, visible, faded, cels: [drawing | null] }: top layer first, one cel per frame;
     //             null holds the layer's drawing from an earlier frame
     // drawing   = { key, rev, canvas, strokes: [stroke], undo: [op], redo: [op], queue: [stroke], full, trash: [Item], dirty, edits }
     //             (rev counts edits, so a thumbnail knows when to redraw)
@@ -31,16 +31,15 @@ Rectangle {
     property int layerCount: 0
     property int currentLayer: 0
     readonly property int maxLayers: 3
+    readonly property real layerFade: 0.5 // how much of its ink a faded layer shows
     property int frameCount: 0
     property int current: 0
     property int historyRev: 0 // bumped on every edit so Undo/Redo enablement re-evaluates
     property int frameKeys: 0  // last drawing key handed out; the storage worker caches saved drawings by key
 
     // Tools
-    // One pressure-sensitive pen in three sizes: black to finish, light grey to plan.
-    // Flip the Marker, or pick the eraser, to erase.
-    property string inkColor: "#000000"
-    readonly property string planInk: "#c0c0c0"
+    // One pressure-sensitive pen in three sizes, in black (older animations may have grey
+    // planning ink: it still shows, and exports leave it out). Flip the Marker, or pick the eraser, to erase.
     property bool eraserTool: false
     property var sizes: [2, 5, 10]
     property int sizeIndex: 1
@@ -63,7 +62,7 @@ Rectangle {
     // xochitl's own fast pen path while this heartbeat says the canvas is up ("on x y w h size
     // eraserTool eraseRadius", screen px), and whites out the eraser's path the same way. It counts
     // a heartbeat older than 3 s as off.
-    readonly property bool inkArmed: isRm2 && !!frame && !isPlaying && !showExportModal && !showProjects && !showRename
+    readonly property bool inkArmed: isRm2 && !!frame && !isPlaying && !lassoTool && !showExportModal && !showProjects && !showRename
     function armInk(on) {
         var p = stage.mapToItem(null, 0, 0), xhr = new XMLHttpRequest();
         xhr.open("PUT", "file:///tmp/animator-ink");
@@ -72,7 +71,7 @@ Rectangle {
     }
     onInkArmedChanged: armInk(inkArmed)
     onSizeIndexChanged: if (inkArmed) armInk(true)
-    onEraserToolChanged: if (inkArmed) armInk(true)
+    onEraserToolChanged: { if (eraserTool) lassoTool = false; if (inkArmed) armInk(true); }
     Timer { interval: 1000; repeat: true; running: root.inkArmed; onTriggered: root.armInk(true) }
 
     AppLoad {
@@ -85,9 +84,10 @@ Rectangle {
             root.penPressure = v[0] / 1000;
             root.penEraser = v[3] === "1";
             if (root.penEraser && root.live) root.liveToEraser();
+            if (root.penEraser && root.lassoDrag) root.lassoToEraser();
             // On the reMarkable 2 the pen's release can arrive looking like a palm's, which the
             // canvas refuses; the pen leaving the glass ends the stroke instead
-            if (root.isRm2 && v[4] === "0" && (root.live || root.liveErasing)) root.endGesture();
+            if (root.isRm2 && v[4] === "0" && (root.live || root.liveErasing || root.lassoDrag)) root.endGesture();
         }
     }
 
@@ -101,6 +101,17 @@ Rectangle {
     readonly property int eraseRun: 32 // points the eraser skips at once when their box is out of its reach
     readonly property int eraseRadius: 16 // px: the eraser rubs out points this close to its path (plus their half width)
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
+
+    // Lasso: loop strokes of the drawing under the pen, then drag the box around them
+    property bool lassoTool: false
+    property var lassoed: []            // the strokes in the box
+    property rect lassoBox              // around them (stage px); empty: nothing lassoed
+    property point lassoShift           // how far the box has been dragged
+    property var lassoDrag: null        // { x, y, before } while the pen drags the box
+    property bool lassoLifted: false    // the strokes are off the drawing, following the pen
+    readonly property int lassoPad: 12  // px between the strokes and their box
+    readonly property int lassoSlop: 6  // px the pen moves before a drag lifts the strokes
+    onLassoToolChanged: { if (lassoTool) eraserTool = false; dropLasso(); }
     property bool liveErasing: false
     property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
 
@@ -118,11 +129,11 @@ Rectangle {
 
     // The drawing under the pen: the current layer's at the current frame (its own or a held one)
     readonly property var frame: historyRev >= 0 && current < frameCount ? drawingAt(currentLayer, current) : null
-    readonly property bool canUndo: historyRev >= 0 && !!frame && frame.undo.length > 0
-    readonly property bool canRedo: historyRev >= 0 && !!frame && frame.redo.length > 0
+    readonly property bool canUndo: historyRev >= 0 && (!!frame && frame.undo.length > 0 || timelineUndo.length > 0)
+    readonly property bool canRedo: historyRev >= 0 && (!!frame && frame.redo.length > 0 || timelineRedo.length > 0)
 
-    onCurrentChanged: refreshLayers()
-    onCurrentLayerChanged: refreshLayers()
+    onCurrentChanged: { dropLasso(); refreshLayers(); }
+    onCurrentLayerChanged: { dropLasso(); refreshLayers(); }
 
     // Latency probe: pen move -> next frame the window has drawn (app side only; the e-ink
     // panel adds its own refresh on top)
@@ -136,6 +147,7 @@ Rectangle {
         }
     }
     onIsPlayingChanged: refreshLayers()
+    onFrameCountChanged: if (frameCount < 2) isPlaying = false // one frame doesn't play: "playing" it would lock the pen out
     onOnionDepthChanged: refreshLayers()
 
     Component.onCompleted: {
@@ -199,7 +211,7 @@ Rectangle {
             f.edits = [];
             n++;
         }
-        var shape = layers.map(l => ({ name: l.name, visible: l.visible, cels: l.cels.map(d => d ? d.key : 0) }));
+        var shape = layers.map(l => ({ name: l.name, visible: l.visible, faded: l.faded, cels: l.cels.map(d => d ? d.key : 0) }));
         storage.sendMessage({ op: "save", dir: storageDir,
                               project: { id: projectId, name: projectName, fps: fps, layers: shape, whole: whole, edits: edits } });
         console.log("[Animator][perf] save handoff", n, "of", all.length, "drawings,", pts, "pts,", Date.now() - t0, "ms");
@@ -282,14 +294,17 @@ Rectangle {
 
     function blankLayers() { return [{ name: "Layer 1", visible: true, cels: [[]] }]; }
 
-    // Replace every layer with the given ones: [{ name, visible, cels: [strokes | null] }]
+    // Replace every layer with the given ones: [{ name, visible, faded, cels: [strokes | null] }]
     function resetLayers(data) {
         loading = true;
         isPlaying = false;
         drawings().forEach(d => d.canvas.destroy());
+        timelineUndo = [];
+        timelineRedo = [];
         currentLayer = 0; // every project has layer 0, so bindings never look past the layers swapped in below
+        dropLasso();
         frameKeys = 0; // keys 1..n, layer by layer, as the storage worker keys a project it loads
-        layers = data.map(dl => ({ name: dl.name, visible: dl.visible, cels: dl.cels.map(s => s ? newDrawing(s) : null) }));
+        layers = data.map(dl => ({ name: dl.name, visible: dl.visible, faded: !!dl.faded, cels: dl.cels.map(s => s ? newDrawing(s) : null) }));
         layerCount = layers.length;
         frameCount = data[0].cels.length;
         current = 0;
@@ -335,9 +350,13 @@ Rectangle {
     // ---------------------------------------------------------------
     function newDrawing(strokes) {
         var d = { key: ++frameKeys, rev: 0, strokes: strokes, undo: [], redo: [], parts: [], trash: [], edits: null };
+        giveCanvas(d);
+        return d;
+    }
+
+    function giveCanvas(d) {
         d.canvas = canvasComp.createObject(stage);
         layoutParts(d);
-        return d;
     }
 
     // Cut the drawing's canvas into parts of frameTile px, each repainted in full
@@ -373,76 +392,130 @@ Rectangle {
 
     // A new frame: a drawing on the current layer (blank or a copy); the other layers hold
     function insertFrame(at, copyFrom) {
+        var before = timeline();
         for (var l = 0; l < layers.length; l++) {
             layers[l].cels.splice(at, 0, l === currentLayer ? newDrawing(copyFrom ? copyFrom.strokes.slice() : []) : null);
             keepFirstDrawing(l);
         }
         frameCount = layers[0].cels.length;
         current = at;
-        refreshLayers();
-        historyRev++;
+        timelineEdited(before);
     }
 
+    // Delete the current layer's drawing here, the reverse of New frame: the layer holds its earlier
+    // drawing instead, and the frame itself goes when no other layer has a drawing of its own here
+    readonly property bool canDeleteFrame: historyRev >= 0 && layerCount > 0 && current < frameCount
+                                           && (!!layers[currentLayer].cels[current] || !layers.some(l => l.cels[current]))
     function deleteFrame() {
         if (frameCount <= 1) { clearFrame(); return; }
-        for (var l = 0; l < layers.length; l++) {
-            var cels = layers[l].cels, d = cels.splice(current, 1)[0];
-            if (!d) continue;
-            if (current < cels.length && !cels[current]) cels[current] = d; // still held in the next frame
-            else d.canvas.destroy();
-            keepFirstDrawing(l);
+        if (!canDeleteFrame) return; // a hold where other layers draw: nothing of this layer's to delete
+        var before = timeline(), cels = layers[currentLayer].cels;
+        if (layers.some((l, i) => i !== currentLayer && l.cels[current])) cels[current] = null;
+        else {
+            layers.forEach(l => l.cels.splice(current, 1));
+            frameCount = layers[0].cels.length;
+            current = Math.min(current, frameCount - 1);
         }
-        frameCount = layers[0].cels.length;
-        current = Math.min(current, frameCount - 1);
-        refreshLayers();
-        historyRev++;
+        if (!cels.some(d => d)) cels[0] = newDrawing([]); // a layer always has a drawing
+        keepFirstDrawing(currentLayer);
+        timelineEdited(before);
     }
 
     function moveFrame(from, to) {
         if (from === to) return;
+        var before = timeline();
         for (var l = 0; l < layers.length; l++) {
             layers[l].cels.splice(to, 0, layers[l].cels.splice(from, 1)[0]);
             keepFirstDrawing(l);
         }
         current = to;
-        refreshLayers();
-        historyRev++; // autosave
+        timelineEdited(before);
     }
 
     // Hold: the current layer keeps showing its earlier drawing here. Draw: a drawing of its own,
     // starting as a copy of the held one.
     function toggleHold() {
-        var cels = layers[currentLayer].cels, d = cels[current];
+        var before = timeline(), cels = layers[currentLayer].cels;
         if (current === 0) return; // a layer always starts with a drawing
-        if (d) { d.canvas.destroy(); cels[current] = null; }
-        else cels[current] = newDrawing(frame.strokes.slice());
-        refreshLayers();
-        historyRev++;
+        cels[current] = cels[current] ? null : newDrawing(frame.strokes.slice());
+        timelineEdited(before);
     }
 
     // A new layer goes on top, with one blank drawing held through the whole animation
     function addLayer() {
         if (layers.length >= maxLayers) return;
-        var cels = [newDrawing([])];
+        var before = timeline(), cels = [newDrawing([])];
         for (var i = 1; i < frameCount; i++) cels.push(null);
-        layers.unshift({ name: "Layer " + (layers.length + 1), visible: true, cels: cels });
+        layers.unshift({ name: "Layer " + (layers.length + 1), visible: true, faded: false, cels: cels });
         layerCount = layers.length;
         currentLayer = 0;
-        refreshLayers();
-        historyRev++;
+        timelineEdited(before);
     }
 
     function deleteLayer(l) {
         if (layers.length <= 1) return;
-        layers.splice(l, 1)[0].cels.forEach(d => d && d.canvas.destroy());
-        currentLayer = Math.min(currentLayer, layers.length - 1); // before layerCount, whose bindings index layers by it
+        var before = timeline();
+        layers.splice(l, 1);
+        currentLayer = Math.min(currentLayer - (l < currentLayer ? 1 : 0), layers.length - 1); // before layerCount, whose bindings index layers by it
         layerCount = layers.length;
+        timelineEdited(before);
+    }
+
+    // Timeline undo: frame and layer edits keep a copy of every layer's drawings as they were, and
+    // Undo takes whichever is newer, the latest of these or the drawing's own last stroke edit. A
+    // drawing that leaves the timeline drops its canvas (they're big) and gets a new one on its return.
+    readonly property int timelineUndoMax: 30
+    property var timelineUndo: []
+    property var timelineRedo: []
+    property int editSeq: 0 // orders stroke and timeline edits for Undo and Redo
+
+    function timeline() {
+        return { layers: layers.map(l => ({ layer: l, cels: l.cels.slice() })), current: current, currentLayer: currentLayer };
+    }
+
+    function timelineEdited(before) {
+        timelineUndo.push({ before: before, after: timeline(), seq: ++editSeq });
+        if (timelineUndo.length > timelineUndoMax) timelineUndo.shift();
+        timelineRedo = [];
+        drawings().forEach(d => d.redo = []); // a new edit ends every redo
+        timelineShown(before);
+    }
+
+    function restoreTimeline(t) {
+        var was = timeline();
+        currentLayer = 0; // every timeline has layer 0, so bindings never look past the layers swapped in
+        layers = t.layers.map(s => { s.layer.cels = s.cels.slice(); return s.layer; });
+        // Drawings back on the timeline get a canvas before anything refreshes the layers; the
+        // storage worker forgot them, so they're saved whole
+        drawings().forEach(d => { if (!d.canvas) { giveCanvas(d); d.edits = null; } });
+        layerCount = layers.length;
+        frameCount = layers[0].cels.length;
+        current = t.current;
+        currentLayer = t.currentLayer;
+        timelineShown(was);
+    }
+
+    // No canvases for drawings that left the timeline since `was`
+    function timelineShown(was) {
+        dropLasso(); // its strokes may not be on the drawing under the pen any more
+        var now = drawings();
+        was.layers.forEach(s => s.cels.forEach(d => {
+            if (!d || !d.canvas || now.indexOf(d) >= 0) return;
+            dropTrash(d);
+            d.canvas.destroy();
+            d.canvas = null;
+            d.parts = [];
+        }));
         refreshLayers();
         historyRev++;
     }
 
+    // The eye: shown, faded (to draw cleanly over a rough pass), hidden
     function toggleLayer(l) {
-        layers[l].visible = !layers[l].visible;
+        var layer = layers[l];
+        if (layer.visible) layer.faded = !layer.faded;
+        layer.visible = !layer.visible || layer.faded;
+        layer.cels.forEach(d => d && d.parts.forEach(p => p.full = true)); // redrawn when next shown
         refreshLayers();
         historyRev++;
     }
@@ -471,7 +544,7 @@ Rectangle {
         id: playTimer
         interval: Math.round(1000 / root.fps)
         repeat: true
-        running: root.isPlaying && root.frameCount > 1
+        running: root.isPlaying
         onTriggered: root.current = (root.current + 1) % root.frameCount
     }
 
@@ -537,6 +610,7 @@ Rectangle {
     function paintFrame(c) {
         var f = frameOf(c), p = f && f.parts.find(p => p.canvas === c), ctx = c.getContext("2d");
         if (!p || !ctx) return;
+        var strength = layers.find(l => l.cels.indexOf(f) >= 0).faded ? layerFade : 0;
         var t0 = Date.now(), drawn = 0, mode = p.full ? "full" : p.dirty ? "area" : "queue";
         ctx.save();
         ctx.translate(-c.x, -c.y); // strokes are in stage coordinates
@@ -550,12 +624,12 @@ Rectangle {
             for (var k = 0; k < f.strokes.length; k++) {
                 var b = bounds(f.strokes[k]), m = b.w / 2;
                 if (b.x1 + m < d.x || b.x0 - m > d.x + d.w || b.y1 + m < d.y || b.y0 - m > d.y + d.h) continue;
-                drawStroke(ctx, f.strokes[k]);
+                drawStroke(ctx, f.strokes[k], strength);
                 drawn++;
             }
             ctx.restore();
         }
-        if (!p.full) for (var q = 0; q < p.queue.length; q++) drawStroke(ctx, p.queue[q]);
+        if (!p.full) for (var q = 0; q < p.queue.length; q++) drawStroke(ctx, p.queue[q], strength);
         drawn += p.queue.length;
         ctx.restore();
         p.full = false;
@@ -577,15 +651,15 @@ Rectangle {
         var ctx = c.getContext("2d");
         if (!ctx || !frameCount) return;
         ctx.clearRect(0, 0, c.width, c.height);
-        var cels = layers[currentLayer].cels, i = current, earlier = [];
+        var cels = layers[currentLayer].cels, i = current, earlier = [], k = layers[currentLayer].faded ? layerFade : 1;
         while (i >= 0 && !cels[i]) i--; // where the drawing on screen starts
         while (--i >= 0 && earlier.length < onionDepth) if (cels[i]) earlier.push(cels[i]);
         for (var back = earlier.length; back >= 1; back--) {
             var f = earlier[back - 1];
-            for (var k = 0; k < f.strokes.length; k++) drawStroke(ctx, f.strokes[k], Math.pow(0.5, back));
+            for (var j = 0; j < f.strokes.length; j++) drawStroke(ctx, f.strokes[j], k * Math.pow(0.5, back));
         }
         var next = cels.slice(current + 1).find(d => d);
-        if (next) for (var n = 0; n < next.strokes.length; n++) drawStroke(ctx, next.strokes[n], 0.5, nextInk);
+        if (next) for (var n = 0; n < next.strokes.length; n++) drawStroke(ctx, next.strokes[n], k * 0.5, nextInk);
     }
 
     // A drawing in miniature (thin lines, every few points), centred in the canvas; pts is either
@@ -669,8 +743,9 @@ Rectangle {
         var t = null, ctx = c.getContext("2d");
         if (live) for (var k in live.tiles) if (live.tiles[k].canvas === c) t = live.tiles[k];
         if (!t || !ctx) return; // after pen-up the frame image has the ink
-        ctx.strokeStyle = live.color;
-        ctx.fillStyle = live.color;
+        var ink = layers[currentLayer].faded ? fade(live.color, layerFade) : live.color;
+        ctx.strokeStyle = ink;
+        ctx.fillStyle = ink;
         ctx.lineCap = "round";
         for (var i = 0; i < t.segs.length; i++) {
             var a = t.segs[i][0], b = t.segs[i][1];
@@ -694,8 +769,10 @@ Rectangle {
     }
 
     function pushOp(op) {
+        op.seq = ++editSeq;
         frame.undo.push(op);
         frame.redo = [];
+        timelineRedo = []; // a new edit ends every redo
         historyRev++;
     }
 
@@ -706,27 +783,54 @@ Rectangle {
         f.rev++;
     }
 
+    // The drawing's last stroke edit, unless the last timeline edit is newer
+    function latest(ops, timelineOps) {
+        var op = ops.length ? ops[ops.length - 1] : null, t = timelineOps[timelineOps.length - 1];
+        return t && (!op || t.seq > op.seq) ? null : op;
+    }
+
     function undo() {
-        var f = frame, op = f && f.undo.pop();
-        if (!op) return;
+        if (live || liveErasing || lassoDrag) return; // a finger on Undo while the pen is busy
+        dropLasso();
+        var f = frame, op = f && latest(f.undo, timelineUndo);
+        if (!op) {
+            var t = timelineUndo.pop();
+            if (!t) return;
+            t.seq = ++editSeq;
+            timelineRedo.push(t);
+            return restoreTimeline(t.before);
+        }
+        f.undo.pop();
         if (op.t === "add") spliceStrokes(f, f.strokes.indexOf(op.s), 1, []);
         else spliceStrokes(f, 0, f.strokes.length, op.before);
+        op.seq = ++editSeq;
         f.redo.push(op);
         repaint(f);
         historyRev++;
     }
 
     function redo() {
-        var f = frame, op = f && f.redo.pop();
-        if (!op) return;
+        if (live || liveErasing || lassoDrag) return;
+        dropLasso();
+        var f = frame, op = f && latest(f.redo, timelineRedo);
+        if (!op) {
+            var t = timelineRedo.pop();
+            if (!t) return;
+            t.seq = ++editSeq;
+            timelineUndo.push(t);
+            return restoreTimeline(t.after);
+        }
+        f.redo.pop();
         if (op.t === "add") spliceStrokes(f, f.strokes.length, 0, [op.s]);
         else spliceStrokes(f, 0, f.strokes.length, op.after);
+        op.seq = ++editSeq;
         f.undo.push(op);
         repaint(f);
         historyRev++;
     }
 
     function clearFrame() {
+        dropLasso();
         if (!frame.strokes.length) return;
         if (!layers[currentLayer].cels[current]) toggleHold(); // held: clear a copy, not the earlier frame
         var f = frame;
@@ -838,20 +942,89 @@ Rectangle {
     }
 
     // ---------------------------------------------------------------
+    // LASSO
+    // ---------------------------------------------------------------
+    // Pick the strokes with most of their points inside the loop
+    function lassoPick(loop) {
+        var lb = boxOf(loop, 0, loop.length), b = null;
+        lassoed = frame.strokes.filter(s => {
+            var sb = bounds(s);
+            if (s.tool === "area" || sb.x1 < lb.x0 || sb.x0 > lb.x1 || sb.y1 < lb.y0 || sb.y0 > lb.y1) return false;
+            return s.pts.filter(p => inside(p, loop)).length * 2 > s.pts.length;
+        });
+        lassoed.forEach(s => { b = b ? unite(b, strokeRect(s)) : strokeRect(s); });
+        lassoBox = b ? Qt.rect(b.x - lassoPad, b.y - lassoPad, b.w + 2 * lassoPad, b.h + 2 * lassoPad) : Qt.rect(0, 0, 0, 0);
+    }
+
+    // Whether point p is inside the polygon (even-odd rule)
+    function inside(p, poly) {
+        var c = false;
+        for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+            var a = poly[i], b = poly[j];
+            if ((a.y > p.y) !== (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) c = !c;
+        }
+        return c;
+    }
+
+    function inLassoBox(x, y) {
+        return lassoBox.width > 0 && x >= lassoBox.x && x <= lassoBox.x + lassoBox.width && y >= lassoBox.y && y <= lassoBox.y + lassoBox.height;
+    }
+
+    // Take the strokes off the drawing onto one canvas that follows the pen
+    function lassoLift() {
+        if (!layers[currentLayer].cels[current]) toggleHold(); // held: move a copy's ink, not the earlier frame's
+        var f = frame;
+        lassoDrag.before = f.strokes.slice();
+        lassoed.forEach(s => spliceStrokes(f, f.strokes.indexOf(s), 1, []));
+        repaintArea(f, { x: lassoBox.x, y: lassoBox.y, w: lassoBox.width, h: lassoBox.height });
+        lassoLifted = true;
+        liftCanvas.requestPaint();
+    }
+
+    // Put them back where they were dropped, as one undo step
+    function lassoDrop() {
+        var f = frame, dx = lassoShift.x, dy = lassoShift.y;
+        lassoed = lassoed.map(s => ({ tool: s.tool, color: s.color, pts: s.pts.map(p => ({ x: p.x + dx, y: p.y + dy, w: p.w })) }));
+        spliceStrokes(f, f.strokes.length, 0, lassoed);
+        lassoed.forEach(s => queueStroke(f, s));
+        pushOp({ t: "swap", before: lassoDrag.before, after: f.strokes.slice() });
+        lassoBox = Qt.rect(lassoBox.x + dx, lassoBox.y + dy, lassoBox.width, lassoBox.height);
+        lassoShift = Qt.point(0, 0);
+        lassoLifted = false;
+    }
+
+    // The eraser end came down in the box (on the reMarkable 2 its word can come after the press): erase instead
+    function lassoToEraser() {
+        var at = Qt.point(lassoDrag.x, lassoDrag.y);
+        if (lassoLifted) { lassoShift = Qt.point(0, 0); lassoDrop(); }
+        lassoDrag = null;
+        beginGesture({ position: at }, true);
+    }
+
+    // Let go of the lassoed strokes (but never while they're being dragged)
+    function dropLasso() {
+        if (lassoDrag) return;
+        lassoed = [];
+        lassoBox = Qt.rect(0, 0, 0, 0);
+    }
+
+    // ---------------------------------------------------------------
     // PEN INPUT
     // ---------------------------------------------------------------
     function beginGesture(pt, eraserEnd) {
         if (isPlaying || showExportModal || !frame) return;
-        if (live || liveErasing) endGesture(); // its release never came: keep it, don't orphan its tiles
+        if (live || liveErasing || lassoDrag) endGesture(); // its release never came: keep it, don't orphan its tiles
         var x = pt.position.x, y = pt.position.y;
+        if (lassoTool && !eraserEnd && inLassoBox(x, y)) { lassoDrag = { x: x, y: y }; return; }
+        dropLasso();
         if (eraserEnd) {
             liveErasing = true;
             eraseOp = { x: x, y: y, before: frame.strokes.slice(), hit: false, x0: x, y0: y, x1: x, y1: y };
             eraseAlong(x, y, x, y);
             return;
         }
-        var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
-        live = { tool: "pen", color: inkColor, pts: [p], tiles: {} };
+        var p = { x: x, y: y, w: lassoTool ? 2 : strokeWidth(pt.pressure) };
+        live = { tool: lassoTool ? "lasso" : "pen", color: lassoTool ? "#808080" : "#000000", pts: [p], tiles: {} };
         addSegment(live, p, p);
     }
 
@@ -876,6 +1049,13 @@ Rectangle {
 
     function moveGestureImpl(pt) {
         var x = pt.position.x, y = pt.position.y;
+        if (lassoDrag) {
+            var sx = x - lassoDrag.x, sy = y - lassoDrag.y;
+            if (!lassoLifted && sx * sx + sy * sy < lassoSlop * lassoSlop) return;
+            if (!lassoLifted) lassoLift();
+            lassoShift = Qt.point(sx, sy);
+            return;
+        }
         if (liveErasing) {
             // Erase along the whole path since the last move so fast swipes don't skip strokes
             eraseAlong(eraseOp.x, eraseOp.y, x, y);
@@ -888,7 +1068,7 @@ Rectangle {
         var last = live.pts[live.pts.length - 1];
         var dx = x - last.x, dy = y - last.y;
         if (dx * dx + dy * dy < minStep * minStep) return;
-        var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
+        var p = { x: x, y: y, w: live.tool === "lasso" ? 2 : strokeWidth(pt.pressure) };
         live.pts.push(p);
         addSegment(live, last, p);
     }
@@ -901,7 +1081,12 @@ Rectangle {
             refreshPatch.x = eraseOp.x0 - pad; refreshPatch.y = eraseOp.y0 - pad;
             refreshPatch.width = eraseOp.x1 - eraseOp.x0 + 2 * pad; refreshPatch.height = eraseOp.y1 - eraseOp.y0 + 2 * pad;
         }
-        if (live) {
+        if (lassoDrag && lassoLifted) lassoDrop();
+        lassoDrag = null;
+        if (live && live.tool === "lasso") {
+            for (var t in live.tiles) live.tiles[t].canvas.destroy();
+            lassoPick(live.pts);
+        } else if (live) {
             var f = frame, s = { tool: live.tool, color: live.color, pts: live.pts };
             spliceStrokes(f, f.strokes.length, 0, [s]);
             for (var k in live.tiles) f.trash.push(live.tiles[k].canvas);
@@ -1010,6 +1195,8 @@ Rectangle {
                 c.moveTo(12, 16); c.lineTo(23, 27); break;
             case "eye-off": c.moveTo(7, 29); c.lineTo(29, 7); // then the eye, struck through
             case "eye":
+            case "eye-half": // a faded eye round a solid pupil: the layer at half strength
+                if (name === "eye-half") { c.arc(18, 18, 5, 0, 2 * Math.PI); c.fill(); c.beginPath(); c.globalAlpha = 0.4; }
                 c.moveTo(4, 18); c.quadraticCurveTo(18, 4, 32, 18); c.quadraticCurveTo(18, 32, 4, 18);
                 c.moveTo(23, 18); c.arc(18, 18, 5, 0, 2 * Math.PI); break;
             case "hold": // a drawing held along the timeline
@@ -1029,12 +1216,13 @@ Rectangle {
             case "next": c.moveTo(14, 8); c.lineTo(24, 18); c.lineTo(14, 28); break;
             case "play": c.moveTo(11, 7); c.lineTo(28, 18); c.lineTo(11, 29); c.closePath(); c.fill(); return;
             case "stop": c.rect(10, 10, 16, 16); c.fill(); return;
-            case "new": c.rect(8, 5, 20, 26); c.moveTo(18, 12); c.lineTo(18, 24); c.moveTo(12, 18); c.lineTo(24, 18); break;
             case "copy": c.rect(13, 11, 16, 21); c.moveTo(8, 26); c.lineTo(8, 5); c.lineTo(23, 5); break;
             case "delete": // trash can
                 c.moveTo(6, 9); c.lineTo(30, 9); c.moveTo(14, 9); c.lineTo(14, 5); c.lineTo(22, 5); c.lineTo(22, 9);
                 c.moveTo(9, 9); c.lineTo(11, 31); c.lineTo(25, 31); c.lineTo(27, 9);
                 c.moveTo(15, 14); c.lineTo(15, 26); c.moveTo(21, 14); c.lineTo(21, 26); break;
+            case "lasso": // a loop with its tail
+                c.ellipse(5, 5, 26, 18); c.moveTo(13, 22); c.quadraticCurveTo(15, 28, 10, 32); break;
             case "onion": // the current frame over fainter earlier ones
                 c.arc(23, 18, 9, 0, 2 * Math.PI); c.stroke();
                 c.globalAlpha = 0.45; c.beginPath(); c.arc(16, 18, 9, Math.PI / 2, 3 * Math.PI / 2); c.stroke();
@@ -1078,29 +1266,26 @@ Rectangle {
             Repeater {
                 model: root.sizes.length
                 Btn {
-                    on: root.sizeIndex === index
+                    on: root.sizeIndex === index && !root.eraserTool && !root.lassoTool
                     flat: true
                     width: 58
-                    onTap: { root.sizeIndex = index; root.eraserTool = false; }
-                    Rectangle {
+                    onTap: { root.sizeIndex = index; root.eraserTool = false; root.lassoTool = false; }
+                    Canvas { // a pen line of this size
                         anchors.centerIn: parent
-                        width: 6 + index * 10; height: width; radius: width / 2
-                        color: parent.on ? "white" : "black"
+                        width: 44; height: 36
+                        readonly property color ink: parent.on ? "white" : "black"
+                        onInkChanged: requestPaint()
+                        onPaint: {
+                            var c = getContext("2d");
+                            c.reset();
+                            c.strokeStyle = ink; c.lineWidth = root.sizes[index]; c.lineCap = "round";
+                            c.beginPath(); c.moveTo(8, 24); c.bezierCurveTo(16, 4, 28, 32, 36, 12); c.stroke();
+                        }
                     }
                 }
             }
-            Item { width: 12; height: 1 } // gap between groups
-            Repeater {
-                model: ["#000000", root.planInk]
-                Btn {
-                    on: root.inkColor === modelData && !root.eraserTool
-                    flat: true
-                    width: 58
-                    onTap: { root.inkColor = modelData; root.eraserTool = false; }
-                    Rectangle { anchors.centerIn: parent; width: 30; height: 30; radius: 6; color: modelData; border.color: "white"; border.width: 2 }
-                }
-            }
             Btn { icon: "eraser"; flat: true; width: 58; on: root.eraserTool; onTap: root.eraserTool = !root.eraserTool }
+            Btn { icon: "lasso"; flat: true; width: 58; on: root.lassoTool; onTap: root.lassoTool = !root.lassoTool }
             Item { width: 12; height: 1 } // gap between groups
             Btn { icon: "undo"; flat: true; width: 58; enabledLook: root.canUndo; onTap: root.undo() }
             Btn { icon: "redo"; flat: true; width: 58; enabledLook: root.canRedo; onTap: root.redo() }
@@ -1135,7 +1320,33 @@ Rectangle {
             // Paper under everything: moving it makes Qt draw its old and new area again
             Rectangle { id: refreshPatch; z: -2; color: root.color; visible: root.isRm2; width: 0; height: 0 }
         }
-        Item { id: liveLayer; anchors.fill: parent; z: 1 } // pen preview above the frames
+        Item { // pen preview above the frames
+            id: liveLayer
+            anchors.fill: parent
+            z: 1
+            // The lassoed strokes while they're dragged, and the box around them
+            Canvas {
+                id: liftCanvas
+                x: root.lassoBox.x + root.lassoShift.x; y: root.lassoBox.y + root.lassoShift.y
+                width: Math.max(1, root.lassoBox.width); height: Math.max(1, root.lassoBox.height)
+                visible: root.lassoLifted
+                renderTarget: Canvas.Image
+                renderStrategy: Canvas.Immediate
+                onPaint: {
+                    var ctx = getContext("2d"), strength = root.layers[root.currentLayer].faded ? root.layerFade : 0;
+                    ctx.reset();
+                    ctx.translate(-root.lassoBox.x, -root.lassoBox.y);
+                    root.lassoed.forEach(s => root.drawStroke(ctx, s, strength));
+                }
+            }
+            Rectangle {
+                x: root.lassoBox.x + root.lassoShift.x; y: root.lassoBox.y + root.lassoShift.y
+                width: root.lassoBox.width; height: root.lassoBox.height
+                visible: root.lassoBox.width > 0 && !root.isPlaying
+                color: "transparent"; radius: 6
+                border.color: "black"; border.width: 2
+            }
+        }
 
         // Tell xochitl which e-ink waveform to use for this region. UFast puts the live stroke
         // (and the eraser's gaps) on the panel noticeably sooner; it's 1-bit, so grey ink settles when Fast takes over.
@@ -1144,7 +1355,7 @@ Rectangle {
         DisplayMethodArea {
             anchors.fill: parent
             displayMethod: root.isPlaying ? DisplayMethodArea.Animate
-                         : (root.live || root.liveErasing) && !root.isRm2 ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
+                         : (root.live || root.liveErasing || root.lassoLifted) && !root.isRm2 ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
         }
 
         // The Marker reaches AppLoad apps as plain (non-synthesized) mouse events. Fingers
@@ -1211,7 +1422,10 @@ Rectangle {
                         Btn {
                             palmGuard: true
                             width: 44; height: 52; flat: true
-                            icon: root.historyRev >= 0 && root.layers[index] && root.layers[index].visible ? "eye" : "eye-off"
+                            icon: {
+                                var l = root.historyRev >= 0 && root.layers[index];
+                                return !l || !l.visible ? "eye-off" : l.faded ? "eye-half" : "eye";
+                            }
                             onTap: root.toggleLayer(index)
                         }
                     }
@@ -1345,9 +1559,13 @@ Rectangle {
 
         Bar {
             Btn { palmGuard: true; icon: "prev"; flat: true; onTap: root.goTo(root.current - 1) }
-            Btn { palmGuard: true; icon: root.isPlaying ? "stop" : "play"; flat: true; on: root.isPlaying; onTap: root.isPlaying = !root.isPlaying }
+            Btn {
+                palmGuard: true; icon: root.isPlaying ? "stop" : "play"; flat: true; on: root.isPlaying
+                enabledLook: root.frameCount > 1
+                onTap: root.isPlaying = !root.isPlaying && root.frameCount > 1
+            }
             Btn { palmGuard: true; icon: "next"; flat: true; onTap: root.goTo(root.current + 1) }
-            Btn { palmGuard: true; icon: "new"; flat: true; onTap: root.insertFrame(root.current + 1, null) }
+            Btn { palmGuard: true; label: "+ Frame"; flat: true; onTap: root.insertFrame(root.current + 1, null) }
             Btn { palmGuard: true; icon: "copy"; flat: true; onTap: root.insertFrame(root.current + 1, root.frame) }
             Btn {
                 palmGuard: true
@@ -1357,7 +1575,9 @@ Rectangle {
                 label: armed ? "Sure?" : ""
                 flat: true
                 on: armed
+                enabledLook: root.canDeleteFrame
                 onTap: {
+                    if (!root.canDeleteFrame) return;
                     if (armed) { armed = false; root.deleteFrame(); }
                     else { armed = true; disarm.restart(); }
                 }
@@ -1695,7 +1915,7 @@ Rectangle {
         for (var f = 0; f < frameCount; f++) {
             var shown = [];
             for (var l = layers.length - 1; l >= 0; l--) { // bottom layer first
-                var d = layers[l].visible ? drawingAt(l, f) : null;
+                var d = layers[l].visible && !layers[l].faded ? drawingAt(l, f) : null; // a faded layer is a rough
                 if (d) shown.push({ name: layers[l].name, strokes: d.strokes.filter(s => !isPlanning(s)) }); // finished ink only
             }
             frames.push(shown);
