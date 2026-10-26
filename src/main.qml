@@ -62,7 +62,7 @@ Rectangle {
     // xochitl's own fast pen path while this heartbeat says the canvas is up ("on x y w h size
     // eraserTool eraseRadius", screen px), and whites out the eraser's path the same way. It counts
     // a heartbeat older than 3 s as off.
-    readonly property bool inkArmed: isRm2 && !!frame && !isPlaying && !showExportModal && !showProjects && !showRename
+    readonly property bool inkArmed: isRm2 && !!frame && !isPlaying && !lassoTool && !showExportModal && !showProjects && !showRename
     function armInk(on) {
         var p = stage.mapToItem(null, 0, 0), xhr = new XMLHttpRequest();
         xhr.open("PUT", "file:///tmp/animator-ink");
@@ -71,7 +71,7 @@ Rectangle {
     }
     onInkArmedChanged: armInk(inkArmed)
     onSizeIndexChanged: if (inkArmed) armInk(true)
-    onEraserToolChanged: if (inkArmed) armInk(true)
+    onEraserToolChanged: { if (eraserTool) lassoTool = false; if (inkArmed) armInk(true); }
     Timer { interval: 1000; repeat: true; running: root.inkArmed; onTriggered: root.armInk(true) }
 
     AppLoad {
@@ -86,7 +86,7 @@ Rectangle {
             if (root.penEraser && root.live) root.liveToEraser();
             // On the reMarkable 2 the pen's release can arrive looking like a palm's, which the
             // canvas refuses; the pen leaving the glass ends the stroke instead
-            if (root.isRm2 && v[4] === "0" && (root.live || root.liveErasing)) root.endGesture();
+            if (root.isRm2 && v[4] === "0" && (root.live || root.liveErasing || root.lassoDrag)) root.endGesture();
         }
     }
 
@@ -100,6 +100,17 @@ Rectangle {
     readonly property int eraseRun: 32 // points the eraser skips at once when their box is out of its reach
     readonly property int eraseRadius: 16 // px: the eraser rubs out points this close to its path (plus their half width)
     property var eraseOp: null          // { x, y, before, hit } while the eraser is down
+
+    // Lasso: loop strokes of the drawing under the pen, then drag the box around them
+    property bool lassoTool: false
+    property var lassoed: []            // the strokes in the box
+    property rect lassoBox              // around them (stage px); empty: nothing lassoed
+    property point lassoShift           // how far the box has been dragged
+    property var lassoDrag: null        // { x, y, before } while the pen drags the box
+    property bool lassoLifted: false    // the strokes are off the drawing, following the pen
+    readonly property int lassoPad: 12  // px between the strokes and their box
+    readonly property int lassoSlop: 6  // px the pen moves before a drag lifts the strokes
+    onLassoToolChanged: { if (lassoTool) eraserTool = false; dropLasso(); }
     property bool liveErasing: false
     property double moveWaiting: 0      // time of the first pen move not yet on a drawn frame
 
@@ -120,8 +131,8 @@ Rectangle {
     readonly property bool canUndo: historyRev >= 0 && (!!frame && frame.undo.length > 0 || timelineUndo.length > 0)
     readonly property bool canRedo: historyRev >= 0 && (!!frame && frame.redo.length > 0 || timelineRedo.length > 0)
 
-    onCurrentChanged: refreshLayers()
-    onCurrentLayerChanged: refreshLayers()
+    onCurrentChanged: { dropLasso(); refreshLayers(); }
+    onCurrentLayerChanged: { dropLasso(); refreshLayers(); }
 
     // Latency probe: pen move -> next frame the window has drawn (app side only; the e-ink
     // panel adds its own refresh on top)
@@ -290,6 +301,7 @@ Rectangle {
         timelineUndo = [];
         timelineRedo = [];
         currentLayer = 0; // every project has layer 0, so bindings never look past the layers swapped in below
+        dropLasso();
         frameKeys = 0; // keys 1..n, layer by layer, as the storage worker keys a project it loads
         layers = data.map(dl => ({ name: dl.name, visible: dl.visible, faded: !!dl.faded, cels: dl.cels.map(s => s ? newDrawing(s) : null) }));
         layerCount = layers.length;
@@ -774,6 +786,7 @@ Rectangle {
     }
 
     function undo() {
+        dropLasso();
         var f = frame, op = f && latest(f.undo, timelineUndo);
         if (!op) {
             var t = timelineUndo.pop();
@@ -792,6 +805,7 @@ Rectangle {
     }
 
     function redo() {
+        dropLasso();
         var f = frame, op = f && latest(f.redo, timelineRedo);
         if (!op) {
             var t = timelineRedo.pop();
@@ -921,20 +935,81 @@ Rectangle {
     }
 
     // ---------------------------------------------------------------
+    // LASSO
+    // ---------------------------------------------------------------
+    // Pick the strokes with most of their points inside the loop
+    function lassoPick(loop) {
+        var lb = boxOf(loop, 0, loop.length), b = null;
+        lassoed = frame.strokes.filter(s => {
+            var sb = bounds(s);
+            if (s.tool === "area" || sb.x1 < lb.x0 || sb.x0 > lb.x1 || sb.y1 < lb.y0 || sb.y0 > lb.y1) return false;
+            return s.pts.filter(p => inside(p, loop)).length * 2 > s.pts.length;
+        });
+        lassoed.forEach(s => { b = b ? unite(b, strokeRect(s)) : strokeRect(s); });
+        lassoBox = b ? Qt.rect(b.x - lassoPad, b.y - lassoPad, b.w + 2 * lassoPad, b.h + 2 * lassoPad) : Qt.rect(0, 0, 0, 0);
+    }
+
+    // Whether point p is inside the polygon (even-odd rule)
+    function inside(p, poly) {
+        var c = false;
+        for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+            var a = poly[i], b = poly[j];
+            if ((a.y > p.y) !== (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x) c = !c;
+        }
+        return c;
+    }
+
+    function inLassoBox(x, y) {
+        return lassoBox.width > 0 && x >= lassoBox.x && x <= lassoBox.x + lassoBox.width && y >= lassoBox.y && y <= lassoBox.y + lassoBox.height;
+    }
+
+    // Take the strokes off the drawing onto one canvas that follows the pen
+    function lassoLift() {
+        if (!layers[currentLayer].cels[current]) toggleHold(); // held: move a copy's ink, not the earlier frame's
+        var f = frame;
+        lassoDrag.before = f.strokes.slice();
+        lassoed.forEach(s => spliceStrokes(f, f.strokes.indexOf(s), 1, []));
+        repaintArea(f, { x: lassoBox.x, y: lassoBox.y, w: lassoBox.width, h: lassoBox.height });
+        lassoLifted = true;
+        liftCanvas.requestPaint();
+    }
+
+    // Put them back where they were dropped, as one undo step
+    function lassoDrop() {
+        var f = frame, dx = lassoShift.x, dy = lassoShift.y;
+        lassoed = lassoed.map(s => ({ tool: s.tool, color: s.color, pts: s.pts.map(p => ({ x: p.x + dx, y: p.y + dy, w: p.w })) }));
+        spliceStrokes(f, f.strokes.length, 0, lassoed);
+        lassoed.forEach(s => queueStroke(f, s));
+        pushOp({ t: "swap", before: lassoDrag.before, after: f.strokes.slice() });
+        lassoBox = Qt.rect(lassoBox.x + dx, lassoBox.y + dy, lassoBox.width, lassoBox.height);
+        lassoShift = Qt.point(0, 0);
+        lassoLifted = false;
+    }
+
+    // Let go of the lassoed strokes (but never while they're being dragged)
+    function dropLasso() {
+        if (lassoDrag) return;
+        lassoed = [];
+        lassoBox = Qt.rect(0, 0, 0, 0);
+    }
+
+    // ---------------------------------------------------------------
     // PEN INPUT
     // ---------------------------------------------------------------
     function beginGesture(pt, eraserEnd) {
         if (isPlaying || showExportModal || !frame) return;
-        if (live || liveErasing) endGesture(); // its release never came: keep it, don't orphan its tiles
+        if (live || liveErasing || lassoDrag) endGesture(); // its release never came: keep it, don't orphan its tiles
         var x = pt.position.x, y = pt.position.y;
+        if (lassoTool && !eraserEnd && inLassoBox(x, y)) { lassoDrag = { x: x, y: y }; return; }
+        dropLasso();
         if (eraserEnd) {
             liveErasing = true;
             eraseOp = { x: x, y: y, before: frame.strokes.slice(), hit: false, x0: x, y0: y, x1: x, y1: y };
             eraseAlong(x, y, x, y);
             return;
         }
-        var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
-        live = { tool: "pen", color: "#000000", pts: [p], tiles: {} };
+        var p = { x: x, y: y, w: lassoTool ? 2 : strokeWidth(pt.pressure) };
+        live = { tool: lassoTool ? "lasso" : "pen", color: lassoTool ? "#808080" : "#000000", pts: [p], tiles: {} };
         addSegment(live, p, p);
     }
 
@@ -959,6 +1034,13 @@ Rectangle {
 
     function moveGestureImpl(pt) {
         var x = pt.position.x, y = pt.position.y;
+        if (lassoDrag) {
+            var sx = x - lassoDrag.x, sy = y - lassoDrag.y;
+            if (!lassoLifted && sx * sx + sy * sy < lassoSlop * lassoSlop) return;
+            if (!lassoLifted) lassoLift();
+            lassoShift = Qt.point(sx, sy);
+            return;
+        }
         if (liveErasing) {
             // Erase along the whole path since the last move so fast swipes don't skip strokes
             eraseAlong(eraseOp.x, eraseOp.y, x, y);
@@ -971,7 +1053,7 @@ Rectangle {
         var last = live.pts[live.pts.length - 1];
         var dx = x - last.x, dy = y - last.y;
         if (dx * dx + dy * dy < minStep * minStep) return;
-        var p = { x: x, y: y, w: strokeWidth(pt.pressure) };
+        var p = { x: x, y: y, w: live.tool === "lasso" ? 2 : strokeWidth(pt.pressure) };
         live.pts.push(p);
         addSegment(live, last, p);
     }
@@ -984,7 +1066,12 @@ Rectangle {
             refreshPatch.x = eraseOp.x0 - pad; refreshPatch.y = eraseOp.y0 - pad;
             refreshPatch.width = eraseOp.x1 - eraseOp.x0 + 2 * pad; refreshPatch.height = eraseOp.y1 - eraseOp.y0 + 2 * pad;
         }
-        if (live) {
+        if (lassoDrag && lassoLifted) lassoDrop();
+        lassoDrag = null;
+        if (live && live.tool === "lasso") {
+            for (var t in live.tiles) live.tiles[t].canvas.destroy();
+            lassoPick(live.pts);
+        } else if (live) {
             var f = frame, s = { tool: live.tool, color: live.color, pts: live.pts };
             spliceStrokes(f, f.strokes.length, 0, [s]);
             for (var k in live.tiles) f.trash.push(live.tiles[k].canvas);
@@ -1119,6 +1206,8 @@ Rectangle {
                 c.moveTo(6, 9); c.lineTo(30, 9); c.moveTo(14, 9); c.lineTo(14, 5); c.lineTo(22, 5); c.lineTo(22, 9);
                 c.moveTo(9, 9); c.lineTo(11, 31); c.lineTo(25, 31); c.lineTo(27, 9);
                 c.moveTo(15, 14); c.lineTo(15, 26); c.moveTo(21, 14); c.lineTo(21, 26); break;
+            case "lasso": // a loop with its tail
+                c.ellipse(5, 5, 26, 18); c.moveTo(13, 22); c.quadraticCurveTo(15, 28, 10, 32); break;
             case "onion": // the current frame over fainter earlier ones
                 c.arc(23, 18, 9, 0, 2 * Math.PI); c.stroke();
                 c.globalAlpha = 0.45; c.beginPath(); c.arc(16, 18, 9, Math.PI / 2, 3 * Math.PI / 2); c.stroke();
@@ -1162,10 +1251,10 @@ Rectangle {
             Repeater {
                 model: root.sizes.length
                 Btn {
-                    on: root.sizeIndex === index
+                    on: root.sizeIndex === index && !root.eraserTool && !root.lassoTool
                     flat: true
                     width: 58
-                    onTap: { root.sizeIndex = index; root.eraserTool = false; }
+                    onTap: { root.sizeIndex = index; root.eraserTool = false; root.lassoTool = false; }
                     Canvas { // a pen line of this size
                         anchors.centerIn: parent
                         width: 44; height: 36
@@ -1181,6 +1270,7 @@ Rectangle {
                 }
             }
             Btn { icon: "eraser"; flat: true; width: 58; on: root.eraserTool; onTap: root.eraserTool = !root.eraserTool }
+            Btn { icon: "lasso"; flat: true; width: 58; on: root.lassoTool; onTap: root.lassoTool = !root.lassoTool }
             Item { width: 12; height: 1 } // gap between groups
             Btn { icon: "undo"; flat: true; width: 58; enabledLook: root.canUndo; onTap: root.undo() }
             Btn { icon: "redo"; flat: true; width: 58; enabledLook: root.canRedo; onTap: root.redo() }
@@ -1215,7 +1305,33 @@ Rectangle {
             // Paper under everything: moving it makes Qt draw its old and new area again
             Rectangle { id: refreshPatch; z: -2; color: root.color; visible: root.isRm2; width: 0; height: 0 }
         }
-        Item { id: liveLayer; anchors.fill: parent; z: 1 } // pen preview above the frames
+        Item { // pen preview above the frames
+            id: liveLayer
+            anchors.fill: parent
+            z: 1
+            // The lassoed strokes while they're dragged, and the box around them
+            Canvas {
+                id: liftCanvas
+                x: root.lassoBox.x + root.lassoShift.x; y: root.lassoBox.y + root.lassoShift.y
+                width: Math.max(1, root.lassoBox.width); height: Math.max(1, root.lassoBox.height)
+                visible: root.lassoLifted
+                renderTarget: Canvas.Image
+                renderStrategy: Canvas.Immediate
+                onPaint: {
+                    var ctx = getContext("2d"), strength = root.layers[root.currentLayer].faded ? root.layerFade : 0;
+                    ctx.reset();
+                    ctx.translate(-root.lassoBox.x, -root.lassoBox.y);
+                    root.lassoed.forEach(s => root.drawStroke(ctx, s, strength));
+                }
+            }
+            Rectangle {
+                x: root.lassoBox.x + root.lassoShift.x; y: root.lassoBox.y + root.lassoShift.y
+                width: root.lassoBox.width; height: root.lassoBox.height
+                visible: root.lassoBox.width > 0 && !root.isPlaying
+                color: "transparent"; radius: 6
+                border.color: "black"; border.width: 2
+            }
+        }
 
         // Tell xochitl which e-ink waveform to use for this region. UFast puts the live stroke
         // (and the eraser's gaps) on the panel noticeably sooner; it's 1-bit, so grey ink settles when Fast takes over.
@@ -1224,7 +1340,7 @@ Rectangle {
         DisplayMethodArea {
             anchors.fill: parent
             displayMethod: root.isPlaying ? DisplayMethodArea.Animate
-                         : (root.live || root.liveErasing) && !root.isRm2 ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
+                         : (root.live || root.liveErasing || root.lassoLifted) && !root.isRm2 ? DisplayMethodArea.UFast : DisplayMethodArea.Fast
         }
 
         // The Marker reaches AppLoad apps as plain (non-synthesized) mouse events. Fingers
